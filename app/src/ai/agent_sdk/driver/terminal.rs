@@ -35,6 +35,21 @@ use super::{command_guard, AgentDriverError};
 
 const TERMINAL_SESSION_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// 命令“长时间无动静”多久后提醒用户。
+///
+/// 与 [`command_guard::COMMAND_TIMEOUT`] 的区别：那个是硬性截止（到了就杀），
+/// 这个是**软提醒**（还在跑，但先告知用户一声），不会中断命令。
+///
+/// 取 5 分钟：正常的构建 / 测试很少无输出地跑这么久，而卡在交互态的命令
+/// （等密码、等确认）会静默停在这个时长以上。
+const INACTIVITY_ALERT_THRESHOLD: Duration = Duration::from_secs(5 * 60);
+
+/// 无动静检测的采样间隔。
+///
+/// 比阈值小得多：只有在**连续两个采样点输出行数完全相同**时才判定静止，
+/// 间隔越小定位越准，但采样本身要抢终端 model 锁，所以不能太密。
+const INACTIVITY_SAMPLE_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Options for creating the terminal view before constructing a [`TerminalDriver`].
 pub(crate) struct TerminalDriverOptions {
     pub working_dir: PathBuf,
@@ -244,6 +259,89 @@ let _ = driver
         );
     }
 
+    /// 长时间无动静时提醒用户。
+    ///
+    /// 与 [`Self::start_command_watchdog`] 不同，这里**不终止命令**，只发通知：
+    /// 卡在交互态（等密码 / 等确认）的命令不会自己恢复，用户在切走之后
+    /// 往往不会注意到终端其实停在等输入。
+    ///
+    /// 两个判据（都命中才提醒，避免误报正常的长构建）：
+    /// 1. 命令仍在跑——`waiting_command` 未取走。
+    /// 2. 输出持续无增长——周期性采样 block 的输出行数，连续多个采样点不变。
+    ///
+    /// 只看“是否已开始执行”不够：一个真的在编译的 `cargo build` 也会长时间
+    /// 无输出，但它其实在推进。所以这里用“输出行数不再增长”作为真正的静止判据。
+    fn start_inactivity_watchdog(&mut self, ctx: &mut ModelContext<Self>) {
+        let driver = ctx.spawner();
+        let threshold = INACTIVITY_ALERT_THRESHOLD;
+        let sample_interval = INACTIVITY_SAMPLE_INTERVAL;
+
+        ctx.spawn(
+            async move {
+                // 首次等待完整阈值，之后再按采样间隔轮询。
+                warpui::r#async::Timer::after(threshold).await;
+                let mut last_seen: Option<u64> = None;
+
+                loop {
+                    let snapshot = driver
+                        .spawn(move |driver, ctx| {
+                            // 命令已结束（或已被超时 watchdog 处理）——停止监控。
+                            if driver.waiting_command.is_none() {
+                                return None;
+                            }
+                            let command = driver
+                                .pending_command_start
+                                .as_ref()
+                                .map(|(cmd, _)| cmd.clone())
+                                .unwrap_or_default();
+                            let lines = driver
+                                .terminal_view
+                                .as_ref(ctx)
+                                .model
+                                .lock()
+                                .block_list()
+                                .blocks()
+                                .last()
+                                .map_or(0, |b| b.output_grid().len() as u64);
+                            Some((command, lines))
+                        })
+                        .await;
+
+                    let Ok(Some((command, lines))) = snapshot else {
+                        return;
+                    };
+
+                    if last_seen == Some(lines) {
+                        // 输出行数在两个采样点之间完全没变 —— 疑似卡住。
+                        log::warn!(
+                            "[agent] no output progress for {threshold:?} ({lines} lines): {command}"
+                        );
+                        let _ = driver
+                            .spawn(move |driver, ctx| {
+                                driver.terminal_view.update(ctx, |terminal, ctx| {
+                                    terminal.maybe_send_ai_command_alert(
+                                        "Zap".to_owned(),
+                                        format!(
+                                            "Oz 的命令已 {} 分钟没有输出，很可能在等待人工输入：\n{command}",
+                                            threshold.as_secs() / 60
+                                        ),
+                                        ctx,
+                                    );
+                                });
+                            })
+                            .await;
+                        // 只提醒一次，不重复骚扰。
+                        return;
+                    }
+
+                    last_seen = Some(lines);
+                    warpui::r#async::Timer::after(sample_interval).await;
+                }
+            },
+            |_, _, _| {},
+        );
+    }
+
     /// Submit `text` to the active CLI agent on the terminal PTY using the
     /// agent-specific submission strategy.
     ///
@@ -317,6 +415,8 @@ let _ = driver
         // 超时兼底：即使命令形态正常，也可能因未知原因卡住。启动后若命令在
         // 期限内正常结束，watchdog 到点时 `waiting_command` 已被取走，形同空转。
         self.start_command_watchdog(ctx);
+        // 长时间无动静也提醒用户，而不是默默等到超时。
+        self.start_inactivity_watchdog(ctx);
 
         Ok(async move {
             let block_id = start_rx

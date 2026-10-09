@@ -940,4 +940,41 @@ mod tests {
             );
         }
     }
+
+    /// 与真实 PTY 实测结果对照（`pty.fork()` + 交互式 bash）。
+    ///
+    /// 这张表是本次实现的依据：起初我以为“括号不配平”会挂，实测发现
+    /// bash 只报语法错就退出；真正会挂的是未闭合引号、未闭合 `$(`、
+    /// 以及**结尾悬空的控制运算符**。测试锁住这个认知，防止回退。
+    #[test]
+    fn matches_real_pty_behaviour() {
+        let expectations = [
+            ("echo 'unclosed", true),
+            ("echo \"unclosed", true),
+            ("echo $(", true),
+            ("echo a |", true),
+            ("echo a &&", true),
+            ("echo a ||", true),
+            ("echo a \\", true),
+            ("python3 - <<'PY'", true),
+            // PTY 实测**不会**挂的写法，不能误伤
+            ("echo (1))", false),
+            ("echo )))", false),
+            ("echo []]", false),
+            ("python3 -c 'print(1))'", false),
+            ("echo $(pwd)", false),
+            ("echo 'it'\\''s'", false),
+            ("awk '{print $1}' f", false),
+            ("if true; then echo x; fi", false),
+            ("echo hello", false),
+            ("git status", false),
+        ];
+        for (cmd, expect_blocked) in expectations {
+            let blocked = check_command(cmd).is_err();
+            assert_eq!(
+                blocked, expect_blocked,
+                "`{cmd}` 预期 blocked={expect_blocked}，实际={blocked}"
+            );
+        }
+    }
 }
