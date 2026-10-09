@@ -44,6 +44,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use instant::Instant;
+use rand::Rng as _;
 use serde_json::{json, Value};
 use uuid::Uuid;
 use warp_multi_agent_api as api;
@@ -3286,6 +3287,74 @@ fn map_genai_error(err: genai::Error) -> OpenAiCompatibleError {
     }
 }
 
+/// BYOP 开流失败的最大重试次数(不含首次尝试)。
+///
+/// 与 controller 层 `response_stream.rs` 的 `MAX_RETRIES = 3` 保持同一量级,
+/// 但两者互不干扰:controller 那套 retry 被 `has_received_client_actions` 挡住
+/// (BYOP 在开流前就已经 emit 过 CreateTask / AddMessagesToTask),永远轮不到它,
+/// 所以这里的重试才是 BYOP 路径实际生效的那一套。
+const BYOP_STREAM_MAX_RETRIES: usize = 3;
+
+/// 判定一次 genai 开流错误是否值得重试。
+///
+/// 只放行「换一次连接/时间就有机会成功」的错误:
+///
+/// - `WebStream` / `WebAdapterCall` / `WebModelCall`:连接被拒、DNS、TLS、
+///   超时、流中断等传输层故障 —— 即截图里 `error sending request for url` 那类。
+/// - `HttpError`:仅 408 / 429 / 5xx 重试。4xx(401 key 错、404 模型名错、
+///   400 请求体非法)重试多少次都一样,直接报错让用户去改配置。
+/// - `Resolver` / 鉴权类 / 请求构造类:不可重试。
+fn is_retryable_genai_error(err: &genai::Error) -> bool {
+    use genai::Error as G;
+    match err {
+        G::WebStream { .. } | G::WebAdapterCall { .. } | G::WebModelCall { .. } => true,
+        G::HttpError { status, .. } => {
+            let code = status.as_u16();
+            code == 408 || code == 429 || (500..600).contains(&code)
+        }
+        G::StreamParse { .. }
+        | G::SerdeJson(_)
+        | G::JsonValueExt(_)
+        | G::InvalidJsonResponseElement { .. }
+        | G::ChatReqHasNoMessages { .. }
+        | G::LastChatMessageIsNotUser { .. }
+        | G::MessageRoleNotSupported { .. }
+        | G::MessageContentTypeNotSupported { .. }
+        | G::JsonModeWithoutInstruction
+        | G::VerbosityParsing { .. }
+        | G::ReasoningParsingError { .. }
+        | G::ServiceTierParsing { .. }
+        | G::PromptCacheRetentionParsing { .. }
+        | G::NoChatResponse { .. }
+        | G::RequiresApiKey { .. }
+        | G::NoAuthResolver { .. }
+        | G::NoAuthData { .. }
+        | G::ModelMapperFailed { .. }
+        | G::ChatResponseGeneration { .. }
+        | G::ChatResponse { .. }
+        | G::Resolver { .. }
+        | G::AdapterNotSupported { .. }
+        | G::Internal(_) => false,
+    }
+}
+
+/// 第 `attempt` 次重试(从 0 开始)前的等待时长:指数退避 + 抖动。
+///
+/// 基准 1s → 2s → 4s,再叠加 0~250ms 的随机抖动。抖动的作用是避免上游刚恢复时
+/// 多个并发 Agent 一起重连把它再次打挂。
+fn retry_backoff(attempt: usize) -> std::time::Duration {
+    const BASE_MILLIS: u64 = 1_000;
+    const MAX_EXPONENT: u32 = 3;
+    const JITTER_MILLIS: u64 = 250;
+
+    let exponent = u32::try_from(attempt)
+        .unwrap_or(MAX_EXPONENT)
+        .min(MAX_EXPONENT);
+    let base = BASE_MILLIS.saturating_mul(2u64.saturating_pow(exponent));
+    let jitter = rand::thread_rng().gen_range(0..=JITTER_MILLIS);
+    std::time::Duration::from_millis(base.saturating_add(jitter))
+}
+
 // ---------------------------------------------------------------------------
 // 主流程
 // ---------------------------------------------------------------------------
@@ -3495,796 +3564,1182 @@ pub async fn generate_byop_output(
     }
 
     let stream = async_stream::stream! {
-        // 1) StreamInit — 始终先发,UI 能立刻显示 "thinking..."
-        yield Ok(api::ResponseEvent {
-            r#type: Some(api::response_event::Type::Init(
-                api::response_event::StreamInit {
-                    request_id: request_id.clone(),
-                    conversation_id,
-                    run_id: String::new(),
-                },
-            )),
-        });
+            // 1) StreamInit — 始终先发,UI 能立刻显示 "thinking..."
+            yield Ok(api::ResponseEvent {
+                r#type: Some(api::response_event::Type::Init(
+                    api::response_event::StreamInit {
+                        request_id: request_id.clone(),
+                        conversation_id,
+                        run_id: String::new(),
+                    },
+                )),
+            });
 
-        // 2) 首轮:CreateTask 升级 Optimistic root → Server。
-        if needs_create_task {
-            yield Ok(create_task_event(&task_id));
-        }
-
-        // 3) 持久化 input 里的 UserQuery / ToolCallResult 到 task.messages。
-        //    (warp server 路径由后端 emit;BYOP 客户端必须自己 emit,见上方注释。)
-        //    tag-in 首轮先写 root,再由下面的 spawn 分支复制到新 subtask;已有 CLI
-        //    subagent 的后续轮直接写 target_task_id。
-        let persistence_task_id = if lrc_should_spawn_subagent {
-            task_id.as_str()
-        } else {
-            target_task_id.as_str()
-        };
-        let mut persistence_messages: Vec<api::Message> = Vec::new();
-        let mut persistence_order: Vec<String> = Vec::new();
-        for (input_idx, input) in params.input.iter().enumerate() {
-            match input {
-                AIAgentInput::UserQuery {
-                    query,
-                    context,
-                    running_command,
-                    ..
-                } => {
-                    let attachments = user_context::collect_user_attachments(context);
-                    log::info!(
-                        "[byop-diag] persistence input[{input_idx}]: task_id={} \
-                         kind=UserQuery query_len={} binaries={} running_command={} \
-                         lrc_command_id={} query={:?}",
-                        persistence_task_id,
-                        query.len(),
-                        attachments.binaries.len(),
-                        running_command.is_some(),
-                        lrc_command_id.as_deref().unwrap_or(""),
-                        snippet_for_log(query, BYOP_DIAG_SNIPPET_CHARS),
-                    );
-                    persistence_order.push(format!(
-                        "{input_idx}:UserQuery(query_len={},binaries={})",
-                        query.len(),
-                        attachments.binaries.len()
-                    ));
-                    persistence_messages.push(make_user_query_message(
-                        persistence_task_id,
-                        &request_id,
-                        query.clone(),
-                        &attachments.binaries,
-                    ));
-                }
-                AIAgentInput::ActionResult { result, .. } => {
-                    let content = tools::serialize_action_result(result).unwrap_or_else(|| {
-                        serde_json::json!({ "result": result.result.to_string() }).to_string()
-                    });
-                    log::info!(
-                        "[byop-diag] persistence input[{input_idx}]: task_id={} \
-                         kind=ActionResult call_id={} content_len={} content={:?}",
-                        persistence_task_id,
-                        result.id,
-                        content.len(),
-                        snippet_for_log(&content, BYOP_DIAG_SNIPPET_CHARS),
-                    );
-                    persistence_order.push(format!(
-                        "{input_idx}:ActionResult(call_id={},content_len={})",
-                        result.id,
-                        content.len()
-                    ));
-                    persistence_messages.push(make_tool_call_result_message(
-                        persistence_task_id,
-                        &request_id,
-                        result.id.to_string(),
-                        content,
-                    ));
-                }
-                _ => {}
+            // 2) 首轮:CreateTask 升级 Optimistic root → Server。
+            if needs_create_task {
+                yield Ok(create_task_event(&task_id));
             }
-        }
-        log::info!(
-            "[byop-diag] persistence summary: request_id={} task_id={} emitted_messages={} \
-             input_order={:?}",
-            request_id,
-            persistence_task_id,
-            persistence_messages.len(),
-            persistence_order,
-        );
-        if !persistence_messages.is_empty() {
-            yield Ok(make_add_messages_event(persistence_task_id, persistence_messages));
-        }
 
-        // 3.5) LRC subagent spawn(对齐上游云端的 cli subagent 注入路径)。
-        //
-        // 当请求来自 alt-screen + agent tagged-in 状态时,`lrc_command_id` 携带当前 LRC
-        // block 的 id 字符串。此处客户端合成两条事件:
-        //   a) AddMessagesToTask(root, [<虚拟 subagent tool_call>])
-        //      在 root.messages 里挂一条 ToolCall::Subagent { task_id=<新 subtask>,
-        //      metadata: Cli { command_id }, payload: "" }。
-        //      conversation `Task::new_subtask` 会从 parent.messages 里按 task_id 匹配
-        //      这条 subagent_call,提取出 SubagentParams 挂到 subtask。
-        //   b) CreateTask(api::Task { id=<新 subtask>, dependencies.parent_task_id=root })
-        //      触发 `apply_client_action::CreateTask`,因 parent_id 非空走 `new_subtask`,
-        //      接着 emit `BlocklistAIHistoryEvent::CreatedSubtask` →
-        //      `cli_controller::handle_history_model_event` 看到 cli_subagent_block_id
-        //      非空,emit `CLISubagentEvent::SpawnedSubagent` → terminal_view 创建
-        //      `CLISubagentView` 浮窗,挂进 `cli_subagent_views` map。
-        //
-        // 切换后续 chunk emit 的 task_id 到 subtask_id,让模型 reasoning/output/tool_call
-        // 全部进 subtask,subagent_view 据此渲染浮窗内容。
-        //
-        // 时序约束:必须在 root CreateTask + UserQuery 持久化之后,模型流之前。
-        // 否则 conversation 找不到 root task / 找不到 user query 引用对。
-        let mut current_task_id = if lrc_should_spawn_subagent {
-            task_id.clone()
-        } else {
-            target_task_id.clone()
-        };
-        if lrc_should_spawn_subagent {
-            let Some(command_id) = lrc_command_id.clone() else {
-                log::warn!("[byop] LRC spawn requested without command_id");
-                yield Err(Arc::new(AIApiError::Other(anyhow::anyhow!(
-                    "BYOP LRC spawn requested without command_id"
-                ))));
-                return;
+            // 3) 持久化 input 里的 UserQuery / ToolCallResult 到 task.messages。
+            //    (warp server 路径由后端 emit;BYOP 客户端必须自己 emit,见上方注释。)
+            //    tag-in 首轮先写 root,再由下面的 spawn 分支复制到新 subtask;已有 CLI
+            //    subagent 的后续轮直接写 target_task_id。
+            let persistence_task_id = if lrc_should_spawn_subagent {
+                task_id.as_str()
+            } else {
+                target_task_id.as_str()
             };
-            let subtask_id = Uuid::new_v4().to_string();
-            let tool_call_id = Uuid::new_v4().to_string();
-            log::info!(
-                "[byop] LRC tag-in: spawning cli subagent subtask={subtask_id} \
-                 command_id={command_id} parent={task_id}"
-            );
-
-            let subagent_tool = api::message::tool_call::Tool::Subagent(
-                api::message::tool_call::Subagent {
-                    task_id: subtask_id.clone(),
-                    payload: String::new(),
-                    metadata: Some(
-                        api::message::tool_call::subagent::Metadata::Cli(
-                            api::message::tool_call::subagent::CliSubagent {
-                                command_id,
-                            },
-                        ),
-                    ),
-                },
-            );
-            let subagent_msg = make_tool_call_message(
-                &task_id,
-                &request_id,
-                &tool_call_id,
-                subagent_tool,
-            );
-            // a) 把 subagent tool_call 挂到 root.messages,供 new_subtask 反查 SubagentParams。
-            yield Ok(make_add_messages_event(&task_id, vec![subagent_msg]));
-            // b) 创建带 parent_task_id 的 subtask;conversation 检测 parent_id 非空 →
-            //    走 `Task::new_subtask` 路径,自动绑定 SubagentParams。
-            yield Ok(create_subtask_event(&subtask_id, &task_id));
-
-            // c) Zap A1:把当前轮的 UserQuery 也复制一份到 subtask,初始化 subtask 的
-            //    exchange.output.messages。否则 CLISubagentView 渲染时 subtask 的 exchanges
-            //    output 为空,浮窗永远只显示 49.6 高度的空对话框,看不到任何内容。
-            //    上游云端在 cli subagent 任务上有完整 ClientAction 序列填 exchange.output,
-            //    BYOP 客户端自管必须显式注入。
-            //
-            //    只复制本轮 UserQuery(`pending_user_queries`),不动 root 的副本(root
-            //    保留 user query 引用以避免 exchange.input 为空导致状态机错乱)。
-            //    后续模型 chunks 走 `current_task_id = subtask_id`,append 到这个起点之后。
-            if !pending_user_queries.is_empty() {
-                let mut subtask_messages: Vec<api::Message> = Vec::new();
-                for (q, imgs) in &pending_user_queries {
-                    subtask_messages.push(make_user_query_message(
-                        &subtask_id,
-                        &request_id,
-                        q.clone(),
-                        imgs,
-                    ));
-                }
-                yield Ok(make_add_messages_event(&subtask_id, subtask_messages));
-            }
-
-            // 后续 chunk emit 切到 subtask。
-            current_task_id = subtask_id;
-        }
-
-        log::info!("[byop] opening stream: model={model_id}");
-        let mut sdk_stream = match client
-            .exec_chat_stream(&model_id, chat_req, Some(&chat_opts))
-            .await
-        {
-            Ok(resp) => {
-                log::info!("[byop] stream opened OK (HTTP request accepted)");
-                resp.stream
-            }
-            Err(e) => {
-                let mapped = map_genai_error(e);
-                log::error!("[byop] open stream failed: {mapped:#}");
-                yield Err(Arc::new(AIApiError::Other(anyhow::anyhow!(
-                    "BYOP open stream failed: {mapped}"
-                ))));
-                return;
-            }
-        };
-
-        // 流式状态:文本 / 推理各自的 message id 在第一次 chunk 到达时生成,
-        // 之后的 chunk 走 AppendToMessageContent 增量追加。
-        let mut text_msg_id: Option<String> = None;
-        let mut reasoning_msg_id: Option<String> = None;
-        // <think>...</think> 流式提取状态:仅当 `use_think_extraction` 为 true 时有意义。
-        // 已知把 reasoning 夹在 <think> 标签里的模型(如 MiniMax M3)用此提取。
-        let mut think_active = false;
-        let mut think_buf = String::new();
-        // tool_call 按 call_id 累积 — genai 流式发的 ToolCallChunk 已带完整 ToolCall
-        // (since 0.4.0 行为),但跨 chunk 同一 call_id 可能多次出现 args 增量,
-        // 用 HashMap 按 id 累积后在流末统一 emit。
-        let mut tool_bufs: HashMap<String, ToolCall> = HashMap::new();
-        let mut tool_order: Vec<String> = Vec::new();
-        // call_id → 首帧占位 ToolCall message 的 id。
-        // 首次 ToolCallChunk 到达且可解析时立即 emit 一条占位卡(让 UI 在 stream End
-        // 之前就能看到"调用 X 工具"反馈),流末用 update_message 原地刷新为最终 args。
-        // 不在表里的 call_id(首帧 parse 失败 / web 工具)走老路径在 End 后一次性 emit。
-        let mut tool_msg_ids: HashMap<String, String> = HashMap::new();
-        // call_id → 上次 update_message 增量刷新的时刻。
-        // 长 args 工具(create_or_edit_document、长 grep query)args 跨多 chunk 累积时,
-        // 节流 ≥ 200ms reparse + update,体感跟文本流一样连续而不是首帧定格到 End。
-        let mut tool_last_update: HashMap<String, Instant> = HashMap::new();
-        // 增量刷新节流阈值:小于此值的连续 chunk 不再 update_message,避免频繁 UI 重排。
-        // 注:SDK stream 每个 ChatStreamEvent 独立 await,多 tool 并发时本就是顺序到达,
-        // 同 tick batch emit 在此层意义不大;真正降抖在节流上,这条注释提醒后续不要瞎引入 batch。
-        const TOOL_ARGS_UPDATE_THROTTLE_MS: u64 = 200;
-        // 诊断:统计 stream 各类事件计数,流末打 INFO log。
-        // 用于排查"消息静默消失"——如果 chunk_count=0 且 tool_count=0,说明上游返回空内容。
-        let mut start_count: u32 = 0;
-        let mut chunk_count: u32 = 0;
-        let mut chunk_bytes: usize = 0;
-        let mut reasoning_count: u32 = 0;
-        let mut reasoning_bytes: usize = 0;
-        let mut tool_chunk_count: u32 = 0;
-        let mut end_count: u32 = 0;
-        let mut other_count: u32 = 0;
-        let mut captured_assistant_text: Option<String> = None;
-        // Ollama 等 provider 的 End.captured_content 有时为空,但 Chunk 事件已送达正文;
-        // 流式累积作为 content→tool 提取的可靠来源(仅 assistant 正文;reasoning 中的
-        // 假设性命令描述不应被当作可执行 tool call,见下方 extract_sources)。
-        let mut streamed_assistant_text = String::new();
-        // 累积本轮 token 使用量。genai 在 ChatStreamEvent::End 事件里携带
-        // captured_usage(Option<Usage>),其 prompt_tokens 是本轮整段 history
-        // (Anthropic / OpenAI 都按"完整请求 prompt"计),completion_tokens 是模型输出。
-        // 二者相加除以 context_window 即为"context 占用率",和 warp 自家 server 路径语义一致。
-        let mut captured_prompt_tokens: i32 = 0;
-        let mut captured_completion_tokens: i32 = 0;
-        // P0-6 prompt cache 命中率监控:从 genai `Usage.prompt_tokens_details` 里拼
-        // 出 Anthropic / OpenAI / Gemini 返回的 cache_read / cache_create 字段。
-        // 详见 stream End 处理逻辑。DeepSeek / Ollama 本身不走 cache 字段,后续
-        // 依然保持 0。
-        let mut captured_cache_read_tokens: i32 = 0;
-        let mut captured_cache_create_tokens: i32 = 0;
-
-        while let Some(item) = sdk_stream.next().await {
-            let event = match item {
-                Ok(ev) => ev,
-                Err(e) => {
-                    let mapped = map_genai_error(e);
-                    let err_text = format!("{mapped:#}");
-                    log::error!("[byop] stream chunk error: {err_text}");
-                    log::error!("[byop-diag] full_request_json_on_error={diag_body_json}");
-                    // 从错误消息里 parse "column N",dump diag_body_json 该位置 ±200 char 上下文 + 字节 hex。
-                    if let Some(col) = err_text
-                        .split("column ")
-                        .nth(1)
-                        .and_then(|s| s.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<usize>().ok())
-                    {
-                        let body = &diag_body_json;
-                        let byte_len = body.len();
-                        let start = col.saturating_sub(200).min(byte_len);
-                        let end = (col + 200).min(byte_len);
-                        let context = body.get(start..end).unwrap_or("(slice failed: 非 char 边界)");
-                        log::error!(
-                            "[byop] error column={col} diag_body_len={byte_len} context[{start}..{end}]={context:?}"
+            let mut persistence_messages: Vec<api::Message> = Vec::new();
+            let mut persistence_order: Vec<String> = Vec::new();
+            for (input_idx, input) in params.input.iter().enumerate() {
+                match input {
+                    AIAgentInput::UserQuery {
+                        query,
+                        context,
+                        running_command,
+                        ..
+                    } => {
+                        let attachments = user_context::collect_user_attachments(context);
+                        log::info!(
+                            "[byop-diag] persistence input[{input_idx}]: task_id={} \
+                             kind=UserQuery query_len={} binaries={} running_command={} \
+                             lrc_command_id={} query={:?}",
+                            persistence_task_id,
+                            query.len(),
+                            attachments.binaries.len(),
+                            running_command.is_some(),
+                            lrc_command_id.as_deref().unwrap_or(""),
+                            snippet_for_log(query, BYOP_DIAG_SNIPPET_CHARS),
                         );
-                        let hex_start = col.saturating_sub(20).min(byte_len);
-                        let hex_end = (col + 20).min(byte_len);
-                        if let Some(slice) = body.as_bytes().get(hex_start..hex_end) {
-                            log::error!("[byop] error bytes[{hex_start}..{hex_end}] hex={slice:02x?}");
-                        }
+                        persistence_order.push(format!(
+                            "{input_idx}:UserQuery(query_len={},binaries={})",
+                            query.len(),
+                            attachments.binaries.len()
+                        ));
+                        persistence_messages.push(make_user_query_message(
+                            persistence_task_id,
+                            &request_id,
+                            query.clone(),
+                            &attachments.binaries,
+                        ));
                     }
+                    AIAgentInput::ActionResult { result, .. } => {
+                        let content = tools::serialize_action_result(result).unwrap_or_else(|| {
+                            serde_json::json!({ "result": result.result.to_string() }).to_string()
+                        });
+                        log::info!(
+                            "[byop-diag] persistence input[{input_idx}]: task_id={} \
+                             kind=ActionResult call_id={} content_len={} content={:?}",
+                            persistence_task_id,
+                            result.id,
+                            content.len(),
+                            snippet_for_log(&content, BYOP_DIAG_SNIPPET_CHARS),
+                        );
+                        persistence_order.push(format!(
+                            "{input_idx}:ActionResult(call_id={},content_len={})",
+                            result.id,
+                            content.len()
+                        ));
+                        persistence_messages.push(make_tool_call_result_message(
+                            persistence_task_id,
+                            &request_id,
+                            result.id.to_string(),
+                            content,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            log::info!(
+                "[byop-diag] persistence summary: request_id={} task_id={} emitted_messages={} \
+                 input_order={:?}",
+                request_id,
+                persistence_task_id,
+                persistence_messages.len(),
+                persistence_order,
+            );
+            if !persistence_messages.is_empty() {
+                yield Ok(make_add_messages_event(persistence_task_id, persistence_messages));
+            }
+
+            // 3.5) LRC subagent spawn(对齐上游云端的 cli subagent 注入路径)。
+            //
+            // 当请求来自 alt-screen + agent tagged-in 状态时,`lrc_command_id` 携带当前 LRC
+            // block 的 id 字符串。此处客户端合成两条事件:
+            //   a) AddMessagesToTask(root, [<虚拟 subagent tool_call>])
+            //      在 root.messages 里挂一条 ToolCall::Subagent { task_id=<新 subtask>,
+            //      metadata: Cli { command_id }, payload: "" }。
+            //      conversation `Task::new_subtask` 会从 parent.messages 里按 task_id 匹配
+            //      这条 subagent_call,提取出 SubagentParams 挂到 subtask。
+            //   b) CreateTask(api::Task { id=<新 subtask>, dependencies.parent_task_id=root })
+            //      触发 `apply_client_action::CreateTask`,因 parent_id 非空走 `new_subtask`,
+            //      接着 emit `BlocklistAIHistoryEvent::CreatedSubtask` →
+            //      `cli_controller::handle_history_model_event` 看到 cli_subagent_block_id
+            //      非空,emit `CLISubagentEvent::SpawnedSubagent` → terminal_view 创建
+            //      `CLISubagentView` 浮窗,挂进 `cli_subagent_views` map。
+            //
+            // 切换后续 chunk emit 的 task_id 到 subtask_id,让模型 reasoning/output/tool_call
+            // 全部进 subtask,subagent_view 据此渲染浮窗内容。
+            //
+            // 时序约束:必须在 root CreateTask + UserQuery 持久化之后,模型流之前。
+            // 否则 conversation 找不到 root task / 找不到 user query 引用对。
+            let mut current_task_id = if lrc_should_spawn_subagent {
+                task_id.clone()
+            } else {
+                target_task_id.clone()
+            };
+            if lrc_should_spawn_subagent {
+                let Some(command_id) = lrc_command_id.clone() else {
+                    log::warn!("[byop] LRC spawn requested without command_id");
                     yield Err(Arc::new(AIApiError::Other(anyhow::anyhow!(
-                        "BYOP stream error: {mapped}"
+                        "BYOP LRC spawn requested without command_id"
                     ))));
                     return;
+                };
+                let subtask_id = Uuid::new_v4().to_string();
+                let tool_call_id = Uuid::new_v4().to_string();
+                log::info!(
+                    "[byop] LRC tag-in: spawning cli subagent subtask={subtask_id} \
+                     command_id={command_id} parent={task_id}"
+                );
+
+                let subagent_tool = api::message::tool_call::Tool::Subagent(
+                    api::message::tool_call::Subagent {
+                        task_id: subtask_id.clone(),
+                        payload: String::new(),
+                        metadata: Some(
+                            api::message::tool_call::subagent::Metadata::Cli(
+                                api::message::tool_call::subagent::CliSubagent {
+                                    command_id,
+                                },
+                            ),
+                        ),
+                    },
+                );
+                let subagent_msg = make_tool_call_message(
+                    &task_id,
+                    &request_id,
+                    &tool_call_id,
+                    subagent_tool,
+                );
+                // a) 把 subagent tool_call 挂到 root.messages,供 new_subtask 反查 SubagentParams。
+                yield Ok(make_add_messages_event(&task_id, vec![subagent_msg]));
+                // b) 创建带 parent_task_id 的 subtask;conversation 检测 parent_id 非空 →
+                //    走 `Task::new_subtask` 路径,自动绑定 SubagentParams。
+                yield Ok(create_subtask_event(&subtask_id, &task_id));
+
+                // c) Zap A1:把当前轮的 UserQuery 也复制一份到 subtask,初始化 subtask 的
+                //    exchange.output.messages。否则 CLISubagentView 渲染时 subtask 的 exchanges
+                //    output 为空,浮窗永远只显示 49.6 高度的空对话框,看不到任何内容。
+                //    上游云端在 cli subagent 任务上有完整 ClientAction 序列填 exchange.output,
+                //    BYOP 客户端自管必须显式注入。
+                //
+                //    只复制本轮 UserQuery(`pending_user_queries`),不动 root 的副本(root
+                //    保留 user query 引用以避免 exchange.input 为空导致状态机错乱)。
+                //    后续模型 chunks 走 `current_task_id = subtask_id`,append 到这个起点之后。
+                if !pending_user_queries.is_empty() {
+                    let mut subtask_messages: Vec<api::Message> = Vec::new();
+                    for (q, imgs) in &pending_user_queries {
+                        subtask_messages.push(make_user_query_message(
+                            &subtask_id,
+                            &request_id,
+                            q.clone(),
+                            imgs,
+                        ));
+                    }
+                    yield Ok(make_add_messages_event(&subtask_id, subtask_messages));
+                }
+
+                // 后续 chunk emit 切到 subtask。
+                current_task_id = subtask_id;
+            }
+
+    // 开流 + 等待首个事件的失败重试。
+            //
+            // genai 的 HTTP 是惰性的:`exec_chat_stream` 只构造 stream,真正的请求在第一次
+            // `poll_next` 时才发出(WebStream 持有 RequestBuilder + response_future)。所以"连接失败"
+            // 不会出现在 `exec_chat_stream` 的返回值里,而是在第一次 `next().await` 时以
+            // `Err(genai::Error::WebStream { .. })` 冒出来 —— 这正是 `error sending request for url`
+            // 那类错误的来源。只重试 `exec_chat_stream` 本身是抓不到的。
+            //
+            // 为什么不用 controller 层的 retry:那边的门槛是 `!has_received_client_actions`,
+            // 而 BYOP 在开流前就已经 emit 了 CreateTask / AddMessagesToTask(见本函数上半部分,
+            // 这些 ClientActions 是 BYOP 客户端自管的持久化,云端不存在),
+            // 于是 `has_received_client_actions` 恒为 true → 那套重试永远不触发。
+            // 在这里重开一条 genai 流则不会重复 emit 那些 ClientAction。
+            //
+            // 为什么只在"还没吐出内容"时重试:此时 UI 上没有任何模型输出,重开一条流不会
+            // 造成重复文本。一旦已经发出过 chunk / tool_call,重试就会把已渲染的内容叠加/冲掉,
+            // 因此 `content_emitted` 置位后不再重试。
+            let mut content_emitted = false;
+            let mut attempts = 0usize;
+            let (mut sdk_stream, first_event) = loop {
+                log::info!("[byop] opening stream: model={model_id}");
+                let mut stream = match client
+                    .exec_chat_stream(&model_id, chat_req.clone(), Some(&chat_opts))
+                    .await
+                {
+                    Ok(resp) => {
+                        log::info!("[byop] stream opened OK (HTTP request accepted)");
+                        resp.stream
+                    }
+                    Err(e) => {
+                        let retryable = is_retryable_genai_error(&e);
+                        let mapped = map_genai_error(e);
+                        log::error!("[byop] open stream failed (retryable={retryable}): {mapped:#}");
+                        if !retryable {
+                            yield Err(Arc::new(AIApiError::Other(anyhow::anyhow!(
+                                "BYOP open stream failed: {mapped}"
+                            ))));
+                            return;
+                        }
+                        if attempts >= BYOP_STREAM_MAX_RETRIES {
+                            yield Err(Arc::new(AIApiError::Other(anyhow::anyhow!(
+                                "BYOP open stream failed after {attempts} retries: {mapped}"
+                            ))));
+                            return;
+                        }
+                        let backoff = retry_backoff(attempts);
+                        log::warn!(
+                            "[byop] open stream failed, retry {}/{} in {:?}: {mapped:#}",
+                            attempts + 1,
+                            BYOP_STREAM_MAX_RETRIES,
+                            backoff
+                        );
+                        attempts += 1;
+                        warpui::r#async::Timer::after(backoff).await;
+                        continue;
+                    }
+                };
+
+                // 惰性 HTTP:发请求发生在第一个 `next()`。这里先 await 一个事件,
+                // 把"请求真的发出去了吗"这一段也纳入重试覆盖。
+                //
+                // 拿到的第一个事件通常是 `ChatStreamEvent::Start`(genai 在 SSE 打开时就发)。
+                // 主循环会消费这个事件来累加 `start_count` 诊断计数,所以缓存后
+                // 回放给它,不要在这里吃掉。
+                match stream.next().await {
+                    Some(Ok(first)) => break (stream, Some(first)),
+                    Some(Err(e)) => {
+                        let retryable = is_retryable_genai_error(&e);
+                        let mapped = map_genai_error(e);
+                        log::error!("[byop] first stream event failed (retryable={retryable}): {mapped:#}");
+                        if !retryable {
+                            yield Err(Arc::new(AIApiError::Other(anyhow::anyhow!(
+                                "BYOP stream error: {mapped}"
+                            ))));
+                            return;
+                        }
+                        if attempts >= BYOP_STREAM_MAX_RETRIES {
+                            yield Err(Arc::new(AIApiError::Other(anyhow::anyhow!(
+                                "BYOP stream error after {attempts} retries: {mapped}"
+                            ))));
+                            return;
+                        }
+                        let backoff = retry_backoff(attempts);
+                        log::warn!(
+                            "[byop] first stream event failed, retry {}/{} in {:?}: {mapped:#}",
+                            attempts + 1,
+                            BYOP_STREAM_MAX_RETRIES,
+                            backoff
+                        );
+                        attempts += 1;
+                        warpui::r#async::Timer::after(backoff).await;
+                        continue;
+                    }
+                    None => {
+                        // 上游直接返回了空流(连接建立后没有任何事件)。当作可重试的
+                        // 传输层异常处理——这在代理把请求吞掉时很常见。
+                        log::error!("[byop] stream ended before first event");
+                        if attempts >= BYOP_STREAM_MAX_RETRIES {
+                            yield Err(Arc::new(AIApiError::Other(anyhow::anyhow!(
+                                "BYOP stream ended before first event after {attempts} retries"
+                            ))));
+                            return;
+                        }
+                        let backoff = retry_backoff(attempts);
+                        log::warn!(
+                            "[byop] stream ended before first event, retry {}/{} in {:?}",
+                            attempts + 1,
+                            BYOP_STREAM_MAX_RETRIES,
+                            backoff
+                        );
+                        attempts += 1;
+                        warpui::r#async::Timer::after(backoff).await;
+                        continue;
+                    }
                 }
             };
 
-            match event {
-                ChatStreamEvent::Start => {
-                    // unit event;UI 已通过 StreamInit 显示 thinking,这里 no-op
-                    start_count += 1;
-                }
-                ChatStreamEvent::Chunk(c) if !c.content.is_empty() => {
-                    chunk_count += 1;
-                    chunk_bytes += c.content.len();
-                    streamed_assistant_text.push_str(&c.content);
-                    if use_think_extraction {
-                        // <think> 标签流式提取:仅对 THINK_TAG_IN_CONTENT_MODELS 白名单内的模型激活。
-                        // 把 /delta/content 中的 <think>...</think> 段路由到 reasoning 通道,
-                        // 其余内容照常走文本通道。支持标签内容跨 chunk 边界。
-                        //
-                        // known limitation: `<think>` 标签字符串本身跨 chunk 截断时(如
-                        // chunk1 末尾为 `<thi`、chunk2 开头为 `nk>`)无法识别,残余字符串
-                        // 作为普通文本输出。大多数推理模型会把 `<think>` 作为完整 token 输出,
-                        // 实际触发概率极低。
-                        let mut rest: &str = &c.content;
-                        loop {
-                            if think_active {
-                                match rest.find("</think>") {
-                                    Some(end) => {
-                                        think_buf.push_str(&rest[..end]);
-                                        let reasoning = std::mem::take(&mut think_buf);
-                                        think_active = false;
-                                        rest = &rest[end + "</think>".len()..];
-                                        if !reasoning.is_empty() {
-                                            reasoning_count += 1;
-                                            reasoning_bytes += reasoning.len();
-                                            if let Some(id) = reasoning_msg_id.clone() {
-                                                yield Ok(make_append_event(&current_task_id, &id, AppendKind::Reasoning(reasoning)));
-                                            } else {
-                                                let new_id = Uuid::new_v4().to_string();
-                                                let mut msg = make_reasoning_message(&current_task_id, &request_id, reasoning);
-                                                msg.id = new_id.clone();
-                                                reasoning_msg_id = Some(new_id);
-                                                yield Ok(make_add_messages_event(&current_task_id, vec![msg]));
-                                            }
+            // 流式状态:文本 / 推理各自的 message id 在第一次 chunk 到达时生成,
+            // 之后的 chunk 走 AppendToMessageContent 增量追加。
+            let mut text_msg_id: Option<String> = None;
+            let mut reasoning_msg_id: Option<String> = None;
+            // <think>...</think> 流式提取状态:仅当 `use_think_extraction` 为 true 时有意义。
+            // 已知把 reasoning 夹在 <think> 标签里的模型(如 MiniMax M3)用此提取。
+            let mut think_active = false;
+            let mut think_buf = String::new();
+            // tool_call 按 call_id 累积 — genai 流式发的 ToolCallChunk 已带完整 ToolCall
+            // (since 0.4.0 行为),但跨 chunk 同一 call_id 可能多次出现 args 增量,
+            // 用 HashMap 按 id 累积后在流末统一 emit。
+            let mut tool_bufs: HashMap<String, ToolCall> = HashMap::new();
+            let mut tool_order: Vec<String> = Vec::new();
+            // call_id → 首帧占位 ToolCall message 的 id。
+            // 首次 ToolCallChunk 到达且可解析时立即 emit 一条占位卡(让 UI 在 stream End
+            // 之前就能看到"调用 X 工具"反馈),流末用 update_message 原地刷新为最终 args。
+            // 不在表里的 call_id(首帧 parse 失败 / web 工具)走老路径在 End 后一次性 emit。
+            let mut tool_msg_ids: HashMap<String, String> = HashMap::new();
+            // call_id → 上次 update_message 增量刷新的时刻。
+            // 长 args 工具(create_or_edit_document、长 grep query)args 跨多 chunk 累积时,
+            // 节流 ≥ 200ms reparse + update,体感跟文本流一样连续而不是首帧定格到 End。
+            let mut tool_last_update: HashMap<String, Instant> = HashMap::new();
+            // 增量刷新节流阈值:小于此值的连续 chunk 不再 update_message,避免频繁 UI 重排。
+            // 注:SDK stream 每个 ChatStreamEvent 独立 await,多 tool 并发时本就是顺序到达,
+            // 同 tick batch emit 在此层意义不大;真正降抖在节流上,这条注释提醒后续不要瞎引入 batch。
+            const TOOL_ARGS_UPDATE_THROTTLE_MS: u64 = 200;
+            // 诊断:统计 stream 各类事件计数,流末打 INFO log。
+            // 用于排查"消息静默消失"——如果 chunk_count=0 且 tool_count=0,说明上游返回空内容。
+            let mut start_count: u32 = 0;
+            let mut chunk_count: u32 = 0;
+            let mut chunk_bytes: usize = 0;
+            let mut reasoning_count: u32 = 0;
+            let mut reasoning_bytes: usize = 0;
+            let mut tool_chunk_count: u32 = 0;
+            let mut end_count: u32 = 0;
+            let mut other_count: u32 = 0;
+            let mut captured_assistant_text: Option<String> = None;
+            // Ollama 等 provider 的 End.captured_content 有时为空,但 Chunk 事件已送达正文;
+            // 流式累积作为 content→tool 提取的可靠来源(仅 assistant 正文;reasoning 中的
+            // 假设性命令描述不应被当作可执行 tool call,见下方 extract_sources)。
+            let mut streamed_assistant_text = String::new();
+            // 累积本轮 token 使用量。genai 在 ChatStreamEvent::End 事件里携带
+            // captured_usage(Option<Usage>),其 prompt_tokens 是本轮整段 history
+            // (Anthropic / OpenAI 都按"完整请求 prompt"计),completion_tokens 是模型输出。
+            // 二者相加除以 context_window 即为"context 占用率",和 warp 自家 server 路径语义一致。
+            let mut captured_prompt_tokens: i32 = 0;
+            let mut captured_completion_tokens: i32 = 0;
+            // P0-6 prompt cache 命中率监控:从 genai `Usage.prompt_tokens_details` 里拼
+            // 出 Anthropic / OpenAI / Gemini 返回的 cache_read / cache_create 字段。
+            // 详见 stream End 处理逻辑。DeepSeek / Ollama 本身不走 cache 字段,后续
+            // 依然保持 0。
+    let mut captured_cache_read_tokens: i32 = 0;
+            let mut captured_cache_create_tokens: i32 = 0;
+
+            // 把重试阶段缓存的首个事件回放到主循环，然后接上真实流。
+            let mut pending_event = first_event;
+            loop {
+                let item = match pending_event.take() {
+                    Some(event) => Some(Ok(event)),
+                    None => sdk_stream.next().await,
+                };
+                let Some(item) = item else {
+                    break;
+                };
+
+                let event = match item {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        // 中途断流：只有在"还没往 UI 发过任何东西"时才能重试。
+                        // 已经渲染了半截文本/占位卡时重开流会让内容重叠，
+                        // 这种情况直接报错让用户自己重发。
+                        if !content_emitted
+                            && attempts < BYOP_STREAM_MAX_RETRIES
+                            && is_retryable_genai_error(&e)
+                        {
+                            let backoff = retry_backoff(attempts);
+                            log::warn!(
+                                "[byop] stream interrupted before any content, retry {}/{} in {:?}: {e:#}",
+                                attempts + 1,
+                                BYOP_STREAM_MAX_RETRIES,
+                                backoff
+                            );
+                            attempts += 1;
+                            warpui::r#async::Timer::after(backoff).await;
+                            // 重新开一条流，并再次缓存它的首个事件。
+                            let (reopened, first) = loop {
+                                let opened = client
+                                    .exec_chat_stream(&model_id, chat_req.clone(), Some(&chat_opts))
+                                    .await;
+                                let mut stream = match opened {
+                                    Ok(resp) => resp.stream,
+                                    Err(reopen_err) => {
+                                        log::error!("[byop] reopen stream failed: {reopen_err:#}");
+                                        if attempts >= BYOP_STREAM_MAX_RETRIES {
+                                            yield Err(Arc::new(AIApiError::Other(anyhow::anyhow!(
+                                                "BYOP stream error after {attempts} retries"
+                                            ))));
+                                            return;
                                         }
+                                        let next_backoff = retry_backoff(attempts);
+                                        log::warn!(
+                                            "[byop] reopen stream retry {}/{} in {:?}",
+                                            attempts + 1,
+                                            BYOP_STREAM_MAX_RETRIES,
+                                            next_backoff
+                                        );
+                                        attempts += 1;
+                                        warpui::r#async::Timer::after(next_backoff).await;
+                                        continue;
+                                    }
+                                };
+
+                                // 先拿一个事件确认连接真的通了（genai 的 HTTP 是惰性的）。
+                                match stream.next().await {
+                                    Some(Ok(ev)) => break (stream, Some(ev)),
+                                    Some(Err(retry_err))
+                                        if is_retryable_genai_error(&retry_err) =>
+                                    {
+                                        log::warn!(
+                                            "[byop] reopen stream first event failed: {retry_err:#}"
+                                        );
+                                    }
+                                    Some(Err(retry_err)) => {
+                                        log::error!(
+                                            "[byop] reopen stream non-retryable error: {retry_err:#}"
+                                        );
+                                        yield Err(Arc::new(AIApiError::Other(anyhow::anyhow!(
+                                            "BYOP stream error: {retry_err}"
+                                        ))));
+                                        return;
                                     }
                                     None => {
-                                        think_buf.push_str(rest);
-                                        break;
+                                        log::warn!("[byop] reopen stream ended before first event");
                                     }
                                 }
-                            } else {
-                                match rest.find("<think>") {
-                                    Some(start) => {
-                                        let before = rest[..start].to_owned();
-                                        think_active = true;
-                                        rest = &rest[start + "<think>".len()..];
-                                        if !before.is_empty() {
-                                            if let Some(id) = text_msg_id.clone() {
-                                                yield Ok(make_append_event(&current_task_id, &id, AppendKind::Text(before)));
-                                            } else {
-                                                let new_id = Uuid::new_v4().to_string();
-                                                let mut msg = make_agent_output_message(&current_task_id, &request_id, before);
-                                                msg.id = new_id.clone();
-                                                text_msg_id = Some(new_id);
-                                                yield Ok(make_add_messages_event(&current_task_id, vec![msg]));
+
+                                if attempts >= BYOP_STREAM_MAX_RETRIES {
+                                    yield Err(Arc::new(AIApiError::Other(anyhow::anyhow!(
+                                        "BYOP stream error after {attempts} retries"
+                                    ))));
+                                    return;
+                                }
+                                let next_backoff = retry_backoff(attempts);
+                                log::warn!(
+                                    "[byop] reopen stream retry {}/{} in {:?}",
+                                    attempts + 1,
+                                    BYOP_STREAM_MAX_RETRIES,
+                                    next_backoff
+                                );
+                                attempts += 1;
+                                warpui::r#async::Timer::after(next_backoff).await;
+                            };
+                            sdk_stream = reopened;
+                            pending_event = first;
+                            continue;
+                        }
+                        let mapped = map_genai_error(e);
+                        let err_text = format!("{mapped:#}");
+                        log::error!("[byop] stream chunk error: {err_text}");
+                        log::error!("[byop-diag] full_request_json_on_error={diag_body_json}");
+                        // 从错误消息里 parse "column N",dump diag_body_json 该位置 ±200 char 上下文 + 字节 hex。
+                        if let Some(col) = err_text
+                            .split("column ")
+                            .nth(1)
+                            .and_then(|s| s.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<usize>().ok())
+                        {
+                            let body = &diag_body_json;
+                            let byte_len = body.len();
+                            let start = col.saturating_sub(200).min(byte_len);
+                            let end = (col + 200).min(byte_len);
+                            let context = body.get(start..end).unwrap_or("(slice failed: 非 char 边界)");
+                            log::error!(
+                                "[byop] error column={col} diag_body_len={byte_len} context[{start}..{end}]={context:?}"
+                            );
+                            let hex_start = col.saturating_sub(20).min(byte_len);
+                            let hex_end = (col + 20).min(byte_len);
+                            if let Some(slice) = body.as_bytes().get(hex_start..hex_end) {
+                                log::error!("[byop] error bytes[{hex_start}..{hex_end}] hex={slice:02x?}");
+                            }
+                        }
+                        yield Err(Arc::new(AIApiError::Other(anyhow::anyhow!(
+                            "BYOP stream error: {mapped}"
+                        ))));
+                        return;
+                    }
+                };
+
+                match event {
+                    ChatStreamEvent::Start => {
+                        // unit event;UI 已通过 StreamInit 显示 thinking,这里 no-op
+                        start_count += 1;
+                    }
+                    ChatStreamEvent::Chunk(c) if !c.content.is_empty() => {
+                        chunk_count += 1;
+                        chunk_bytes += c.content.len();
+                        streamed_assistant_text.push_str(&c.content);
+                        // 一旦模型吐了正文，重开流会与已 emit 的内容重叠，所以不再重试。
+                        content_emitted = true;
+                        if use_think_extraction {
+                            // <think> 标签流式提取:仅对 THINK_TAG_IN_CONTENT_MODELS 白名单内的模型激活。
+                            // 把 /delta/content 中的 <think>...</think> 段路由到 reasoning 通道,
+                            // 其余内容照常走文本通道。支持标签内容跨 chunk 边界。
+                            //
+                            // known limitation: `<think>` 标签字符串本身跨 chunk 截断时(如
+                            // chunk1 末尾为 `<thi`、chunk2 开头为 `nk>`)无法识别,残余字符串
+                            // 作为普通文本输出。大多数推理模型会把 `<think>` 作为完整 token 输出,
+                            // 实际触发概率极低。
+                            let mut rest: &str = &c.content;
+                            loop {
+                                if think_active {
+                                    match rest.find("</think>") {
+                                        Some(end) => {
+                                            think_buf.push_str(&rest[..end]);
+                                            let reasoning = std::mem::take(&mut think_buf);
+                                            think_active = false;
+                                            rest = &rest[end + "</think>".len()..];
+                                            if !reasoning.is_empty() {
+                                                reasoning_count += 1;
+                                                reasoning_bytes += reasoning.len();
+                                                if let Some(id) = reasoning_msg_id.clone() {
+                                                    yield Ok(make_append_event(&current_task_id, &id, AppendKind::Reasoning(reasoning)));
+                                                } else {
+                                                    let new_id = Uuid::new_v4().to_string();
+                                                    let mut msg = make_reasoning_message(&current_task_id, &request_id, reasoning);
+                                                    msg.id = new_id.clone();
+                                                    reasoning_msg_id = Some(new_id);
+                                                    yield Ok(make_add_messages_event(&current_task_id, vec![msg]));
+                                                }
                                             }
+                                        }
+                                        None => {
+                                            think_buf.push_str(rest);
+                                            break;
                                         }
                                     }
-                                    None => {
-                                        let text = rest.to_owned();
-                                        if !text.is_empty() {
-                                            if let Some(id) = text_msg_id.clone() {
-                                                yield Ok(make_append_event(&current_task_id, &id, AppendKind::Text(text)));
-                                            } else {
-                                                let new_id = Uuid::new_v4().to_string();
-                                                let mut msg = make_agent_output_message(&current_task_id, &request_id, text);
-                                                msg.id = new_id.clone();
-                                                text_msg_id = Some(new_id);
-                                                yield Ok(make_add_messages_event(&current_task_id, vec![msg]));
+                                } else {
+                                    match rest.find("<think>") {
+                                        Some(start) => {
+                                            let before = rest[..start].to_owned();
+                                            think_active = true;
+                                            rest = &rest[start + "<think>".len()..];
+                                            if !before.is_empty() {
+                                                if let Some(id) = text_msg_id.clone() {
+                                                    yield Ok(make_append_event(&current_task_id, &id, AppendKind::Text(before)));
+                                                } else {
+                                                    let new_id = Uuid::new_v4().to_string();
+                                                    let mut msg = make_agent_output_message(&current_task_id, &request_id, before);
+                                                    msg.id = new_id.clone();
+                                                    text_msg_id = Some(new_id);
+                                                    yield Ok(make_add_messages_event(&current_task_id, vec![msg]));
+                                                }
                                             }
                                         }
-                                        break;
+                                        None => {
+                                            let text = rest.to_owned();
+                                            if !text.is_empty() {
+                                                if let Some(id) = text_msg_id.clone() {
+                                                    yield Ok(make_append_event(&current_task_id, &id, AppendKind::Text(text)));
+                                                } else {
+                                                    let new_id = Uuid::new_v4().to_string();
+                                                    let mut msg = make_agent_output_message(&current_task_id, &request_id, text);
+                                                    msg.id = new_id.clone();
+                                                    text_msg_id = Some(new_id);
+                                                    yield Ok(make_add_messages_event(&current_task_id, vec![msg]));
+                                                }
+                                            }
+                                            break;
+                                        }
                                     }
                                 }
                             }
+                        } else {
+                            if let Some(id) = text_msg_id.clone() {
+                                yield Ok(make_append_event(&current_task_id, &id, AppendKind::Text(c.content)));
+                            } else {
+                                let new_id = Uuid::new_v4().to_string();
+                                let mut msg = make_agent_output_message(&current_task_id, &request_id, c.content);
+                                msg.id = new_id.clone();
+                                text_msg_id = Some(new_id);
+                                yield Ok(make_add_messages_event(&current_task_id, vec![msg]));
+                            }
                         }
-                    } else {
-                        if let Some(id) = text_msg_id.clone() {
-                            yield Ok(make_append_event(&current_task_id, &id, AppendKind::Text(c.content)));
+                    }
+                    ChatStreamEvent::Chunk(_) => {}
+                    ChatStreamEvent::ReasoningChunk(c) if !c.content.is_empty() => {
+                        reasoning_count += 1;
+                        reasoning_bytes += c.content.len();
+                        // 同上：reasoning 已经进了 UI，重开流会重复/冲突。
+                        content_emitted = true;
+                        // 运行时 latch:该 (api_type, model_id) 发过 reasoning chunk →
+                        // 标记下一轮起强制 echo reasoning_content,覆盖 INTERLEAVED_RULES
+                        // 静态表外的任意国产/第三方 thinking 模型(对齐 opencode 数据驱动思路,
+                        // 用 stream 探测代替外置 catalog)。
+                        super::reasoning::note_reasoning_seen(api_type, &model_id);
+                        if let Some(id) = reasoning_msg_id.clone() {
+                            yield Ok(make_append_event(&current_task_id, &id, AppendKind::Reasoning(c.content)));
                         } else {
                             let new_id = Uuid::new_v4().to_string();
-                            let mut msg = make_agent_output_message(&current_task_id, &request_id, c.content);
+                            let mut msg = make_reasoning_message(&current_task_id, &request_id, c.content);
                             msg.id = new_id.clone();
-                            text_msg_id = Some(new_id);
+                            reasoning_msg_id = Some(new_id);
                             yield Ok(make_add_messages_event(&current_task_id, vec![msg]));
                         }
                     }
-                }
-                ChatStreamEvent::Chunk(_) => {}
-                ChatStreamEvent::ReasoningChunk(c) if !c.content.is_empty() => {
-                    reasoning_count += 1;
-                    reasoning_bytes += c.content.len();
-                    // 运行时 latch:该 (api_type, model_id) 发过 reasoning chunk →
-                    // 标记下一轮起强制 echo reasoning_content,覆盖 INTERLEAVED_RULES
-                    // 静态表外的任意国产/第三方 thinking 模型(对齐 opencode 数据驱动思路,
-                    // 用 stream 探测代替外置 catalog)。
-                    super::reasoning::note_reasoning_seen(api_type, &model_id);
-                    if let Some(id) = reasoning_msg_id.clone() {
-                        yield Ok(make_append_event(&current_task_id, &id, AppendKind::Reasoning(c.content)));
-                    } else {
-                        let new_id = Uuid::new_v4().to_string();
-                        let mut msg = make_reasoning_message(&current_task_id, &request_id, c.content);
-                        msg.id = new_id.clone();
-                        reasoning_msg_id = Some(new_id);
-                        yield Ok(make_add_messages_event(&current_task_id, vec![msg]));
-                    }
-                }
-                ChatStreamEvent::ReasoningChunk(_) => {}
-                ChatStreamEvent::ToolCallChunk(tc) => {
-                    tool_chunk_count += 1;
-                    let mut call = tc.tool_call;
-                    // 极个别 provider(自建 ollama 代理等)不发 call_id,本地 uuid 兜底。
-                    if call.call_id.is_empty() {
-                        call.call_id = Uuid::new_v4().to_string();
-                    }
-                    // 首次见到该 call_id → 立即 push 占位 ToolCall 消息到 pending_placeholders,
-                    // 让 UI 在 stream End 之前就出现"调用 X 工具"卡片。
-                    // 多 tool 同 tick 内来时:本循环结束前统一 batch emit 一次 add_messages,
-                    // 减少 view tree 重排次数。
-                    // 已在表里(占位已发)且 args 又来新 chunk → 节流 ≥ 200ms reparse + update_message
-                    // 增量刷新 args,长 args 工具(create_or_edit_document、长 grep 等)体感连续。
-                    // web 工具(webfetch/websearch)走自己的 loading 帧链路(L2102 区域),
-                    // 这里跳过避免双卡。
-                    // todowrite 走 BYOP todo 拦截器,合成 Message::UpdateTodos 触发 chip,
-                    // 这里也跳过占位避免出现一张无意义的"调用 todowrite"卡。
-                    if call.fn_name != tools::webfetch::TOOL_NAME
-                        && call.fn_name != tools::websearch::TOOL_NAME
-                        && call.fn_name != tools::todowrite::TOOL_NAME
-                    {
-                        if let Some(msg_id) = tool_msg_ids.get(&call.call_id).cloned() {
-                            // 已 emit 占位 → 节流增量刷新。
-                            let now = Instant::now();
-                            let last = tool_last_update.get(&call.call_id).copied();
-                            let elapsed_ok = last
-                                .map(|t| now.duration_since(t).as_millis() as u64 >= TOOL_ARGS_UPDATE_THROTTLE_MS)
-                                .unwrap_or(true);
-                            if elapsed_ok {
-                                if let Ok(parsed) =
-                                    parse_incoming_tool_call(&call, mcp_context.as_ref())
-                                {
-                                    let mut updated = make_tool_call_message(
-                                        &current_task_id,
-                                        &request_id,
-                                        &call.call_id,
-                                        parsed,
-                                    );
-                                    updated.id = msg_id;
-                                    tool_last_update.insert(call.call_id.clone(), now);
-                                    yield Ok(make_update_message_event(
-                                        &current_task_id,
-                                        updated,
-                                        vec!["tool_call".to_owned()],
-                                    ));
-                                }
-                                // reparse 失败(intermediate 状态):静默,等下次 chunk。
-                            }
-                        } else if let Ok(parsed) =
-                            parse_incoming_tool_call(&call, mcp_context.as_ref())
+                    ChatStreamEvent::ReasoningChunk(_) => {}
+                    ChatStreamEvent::ToolCallChunk(tc) => {
+                        tool_chunk_count += 1;
+                        // 工具占位卡一旦 emit，重开流会与已渲染的卡片撞车，不再重试。
+                        content_emitted = true;
+                        let mut call = tc.tool_call;
+                        // 极个别 provider(自建 ollama 代理等)不发 call_id,本地 uuid 兜底。
+                        if call.call_id.is_empty() {
+                            call.call_id = Uuid::new_v4().to_string();
+                        }
+                        // 首次见到该 call_id → 立即 push 占位 ToolCall 消息到 pending_placeholders,
+                        // 让 UI 在 stream End 之前就出现"调用 X 工具"卡片。
+                        // 多 tool 同 tick 内来时:本循环结束前统一 batch emit 一次 add_messages,
+                        // 减少 view tree 重排次数。
+                        // 已在表里(占位已发)且 args 又来新 chunk → 节流 ≥ 200ms reparse + update_message
+                        // 增量刷新 args,长 args 工具(create_or_edit_document、长 grep 等)体感连续。
+                        // web 工具(webfetch/websearch)走自己的 loading 帧链路(L2102 区域),
+                        // 这里跳过避免双卡。
+                        // todowrite 走 BYOP todo 拦截器,合成 Message::UpdateTodos 触发 chip,
+                        // 这里也跳过占位避免出现一张无意义的"调用 todowrite"卡。
+                        if call.fn_name != tools::webfetch::TOOL_NAME
+                            && call.fn_name != tools::websearch::TOOL_NAME
+                            && call.fn_name != tools::todowrite::TOOL_NAME
                         {
-                            // 首次 parse 成功 → 立即 emit 占位卡。
-                            // 每个 chunk 在未 emit 占位前都会重 parse(即"retry on every
-                            // chunk"),所以即便首帧 args 不全,后续任意 chunk 完整时
-                            // 都会立刻触发占位 emit—— 这就是 P1-4 的覆盖路径,
-                            // 不再需要 generic placeholder variant。
-                            let msg_id = Uuid::new_v4().to_string();
-                            let mut placeholder = make_tool_call_message(
+                            if let Some(msg_id) = tool_msg_ids.get(&call.call_id).cloned() {
+                                // 已 emit 占位 → 节流增量刷新。
+                                let now = Instant::now();
+                                let last = tool_last_update.get(&call.call_id).copied();
+                                let elapsed_ok = last
+                                    .map(|t| now.duration_since(t).as_millis() as u64 >= TOOL_ARGS_UPDATE_THROTTLE_MS)
+                                    .unwrap_or(true);
+                                if elapsed_ok {
+                                    if let Ok(parsed) =
+                                        parse_incoming_tool_call(&call, mcp_context.as_ref())
+                                    {
+                                        let mut updated = make_tool_call_message(
+                                            &current_task_id,
+                                            &request_id,
+                                            &call.call_id,
+                                            parsed,
+                                        );
+                                        updated.id = msg_id;
+                                        tool_last_update.insert(call.call_id.clone(), now);
+                                        yield Ok(make_update_message_event(
+                                            &current_task_id,
+                                            updated,
+                                            vec!["tool_call".to_owned()],
+                                        ));
+                                    }
+                                    // reparse 失败(intermediate 状态):静默,等下次 chunk。
+                                }
+                            } else if let Ok(parsed) =
+                                parse_incoming_tool_call(&call, mcp_context.as_ref())
+                            {
+                                // 首次 parse 成功 → 立即 emit 占位卡。
+                                // 每个 chunk 在未 emit 占位前都会重 parse(即"retry on every
+                                // chunk"),所以即便首帧 args 不全,后续任意 chunk 完整时
+                                // 都会立刻触发占位 emit—— 这就是 P1-4 的覆盖路径,
+                                // 不再需要 generic placeholder variant。
+                                let msg_id = Uuid::new_v4().to_string();
+                                let mut placeholder = make_tool_call_message(
+                                    &current_task_id,
+                                    &request_id,
+                                    &call.call_id,
+                                    parsed,
+                                );
+                                placeholder.id = msg_id.clone();
+                                tool_msg_ids.insert(call.call_id.clone(), msg_id);
+                                tool_last_update.insert(
+                                    call.call_id.clone(),
+                                    Instant::now(),
+                                );
+                                yield Ok(make_add_messages_event(
+                                    &current_task_id,
+                                    vec![placeholder],
+                                ));
+                            }
+                            // 首帧 parse 失败(args 还不完整 / 未知工具):暂不 emit,
+                            // 等下次 chunk 再尝试或 End 时走老路径,避免视觉抖动。
+                        }
+                        // 同一 call_id 多次 chunk:后到的覆盖(genai 已合并 args)。
+                        if !tool_bufs.contains_key(&call.call_id) {
+                            tool_order.push(call.call_id.clone());
+                        }
+                        tool_bufs.insert(call.call_id.clone(), call);
+                    }
+                    ChatStreamEvent::End(end) => {
+                        end_count += 1;
+                        // genai >= 0.4.0 的 captured_content 含 tool_calls。
+                        // 优先用 captured_content 里的 tool_calls(更完整),
+                        // 否则用 streaming 中累积的 tool_bufs。
+                        if let Some(content) = end.captured_content.as_ref() {
+                            if let Some(text) = content.first_text() {
+                                if !text.is_empty() {
+                                    captured_assistant_text = Some(text.to_owned());
+                                }
+                            }
+                            let mut captured_order: Vec<String> = Vec::new();
+                            for call in content.tool_calls() {
+                                if !captured_order.contains(&call.call_id) {
+                                    captured_order.push(call.call_id.clone());
+                                }
+                                tool_bufs.insert(call.call_id.clone(), call.clone());
+                            }
+                            if !captured_order.is_empty() {
+                                for call_id in &tool_order {
+                                    if !captured_order.contains(call_id) {
+                                        captured_order.push(call_id.clone());
+                                    }
+                                }
+                                tool_order = captured_order;
+                            }
+                        }
+                        if let Some(usage) = end.captured_usage.as_ref() {
+                            // 多次 End 取最大值兜底(理论上单次 stream 只有一次 End)。
+                            if let Some(p) = usage.prompt_tokens {
+                                captured_prompt_tokens = captured_prompt_tokens.max(p);
+                            }
+                            if let Some(c) = usage.completion_tokens {
+                                captured_completion_tokens = captured_completion_tokens.max(c);
+                            }
+                            // P0-6 prompt cache 命中率监控:Anthropic / OpenAI / Gemini 在
+                            // `prompt_tokens_details` 中分别返回 `cache_read_input_tokens`
+                            // (Anthropic) / `cached_tokens`(OpenAI) / `cachedContentTokenCount`
+                            // (Gemini)。genai 已统一映射到 `cached_tokens`。
+                            // 同样 `cache_creation_tokens` 仅 Anthropic 提供(写入计费提示)。
+                            // 多次 End 取最大值兜底,语义同 prompt/completion。
+                            if let Some(details) = usage.prompt_tokens_details.as_ref() {
+                                if let Some(r) = details.cached_tokens {
+                                    captured_cache_read_tokens =
+                                        captured_cache_read_tokens.max(r);
+                                }
+                                if let Some(w) = details.cache_creation_tokens {
+                                    captured_cache_create_tokens =
+                                        captured_cache_create_tokens.max(w);
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        other_count += 1;
+                        // ThoughtSignatureChunk 等暂不处理(Gemini 3 thoughts 需要回传给后续轮次,
+                        // 当前 BYOP 不持久化 thought_signatures,接受降级)
+                    }
+                }
+            }
+
+            // Zap:content→tool 提取 fallback 只对 Ollama 生效,与 :1412 的历史过滤对称——
+            // 云端 provider(OpenAI/Anthropic/...)的正文如果恰好长得像 tool JSON(比如模型在
+            // 讲解一段 JSON 示例),不应该被误当成真实 ToolCall 执行。
+            if tool_bufs.is_empty() && api_type == AgentProviderApiType::Ollama {
+                let extract_sources: [&str; 2] = [
+                    streamed_assistant_text.as_str(),
+                    captured_assistant_text.as_deref().unwrap_or(""),
+                ];
+                let mut parsed_any_text = false;
+                for text in extract_sources.into_iter().filter(|t| !t.is_empty()) {
+                    parsed_any_text = true;
+                    let extracted = super::content_tool_calls::extract_tool_calls_from_assistant_text(
+                        text,
+                        &tool_names_for_extract,
+                    );
+                    if extracted.is_empty() {
+                        continue;
+                    }
+                    log::info!(
+                        "[byop] content_tool_extract: found={} names={:?} source_len={}",
+                        extracted.len(),
+                        extracted
+                            .iter()
+                            .map(|call| call.fn_name.as_str())
+                            .collect::<Vec<_>>(),
+                        text.len()
+                    );
+                    for call in extracted {
+                        let call_id = call.call_id.clone();
+                        if !tool_bufs.contains_key(&call_id) {
+                            tool_order.push(call_id.clone());
+                        }
+                        tool_bufs.insert(call_id, call);
+                    }
+                    break;
+                }
+                if tool_bufs.is_empty() && parsed_any_text {
+                    let preview: String = streamed_assistant_text.chars().take(240).collect();
+                    log::info!(
+                        "[byop] content_tool_extract: no tools parsed (streamed={}B captured={}B) \
+                         preview={preview:?}",
+                        streamed_assistant_text.len(),
+                        captured_assistant_text.as_ref().map(|t| t.len()).unwrap_or(0),
+                    );
+                } else if tool_bufs.is_empty() {
+                    log::warn!(
+                        "[byop] content_tool_extract: skipped — no assistant text in stream \
+                         (chunks={chunk_count} reasoning={reasoning_count})"
+                    );
+                }
+            }
+
+            // 流统计 INFO log。chunk_count=0 && tool_count=0 时上游返回为空,
+            // 大概率是 model_id 不被识别 / max_tokens 缺失 / Anthropic API 兼容代理返回 200 但 body 空。
+            let total_tools = tool_bufs.len();
+            log::info!(
+                "[byop] stream stats: start={start_count} chunks={chunk_count} ({chunk_bytes}B) \
+                 reasoning={reasoning_count} ({reasoning_bytes}B) native_tool_chunks={tool_chunk_count} \
+                 ends={end_count} other={other_count} captured_tools={total_tools}"
+            );
+            // P0-6 prompt cache 命中率日志(只在 provider 返回 cache 字段时打)。
+            // ratio = cache_read / (prompt_tokens.max(1)) 表示本轮 input 中有多少比例直接
+            // 命中了缓存。create > 0 表示本轮有 cache write,write 价 ≈ 1.25x base(5m)或
+            // 2x base(1h)。read 价 ≈ 0.1x base,长期看只要 ≥ 1 次复用就回本。
+            // 用 ratio 判定 P0 优化是否生效:同一对话第 2+ 轮应当看到 ratio 显著上升。
+            //
+            // **P2-16**:额外拼一个 `compaction=` 标识。压缩本身会重写历史使 messages
+            // prefix 跨压缩之前后不一致 → 压缩后首轮必然 cache miss。在日志里输出该
+            // 信号让后期分析(`script/analyze-prompt-cache.ps1`)能区分“正常 miss”与
+            // “压缩导致 miss”,避免误伤。
+            if captured_cache_read_tokens > 0 || captured_cache_create_tokens > 0 {
+                let denom = captured_prompt_tokens.max(1);
+                let read_ratio = captured_cache_read_tokens as f32 / denom as f32;
+                let create_ratio = captured_cache_create_tokens as f32 / denom as f32;
+                // 压缩状态:none → 未启用 / inactive → 启用但本轮未变化 /
+                // active(已 hide 的 message id 个数) → 本轮走了压缩路径。
+                let compaction_label = match params.compaction_state.as_ref() {
+                    None => "none".to_owned(),
+                    Some(s) => {
+                        let hidden = s.hidden_message_ids().len();
+                        if hidden == 0 {
+                            "inactive".to_owned()
+                        } else {
+                            format!("active(hidden={hidden})")
+                        }
+                    }
+                };
+                log::info!(
+                    "[byop-cache] prompt_tokens={captured_prompt_tokens} \
+                     cache_read={captured_cache_read_tokens} ({:.1}%) \
+                     cache_create={captured_cache_create_tokens} ({:.1}%) \
+                     model={model_id} compaction={compaction_label}",
+                    read_ratio * 100.0,
+                    create_ratio * 100.0,
+                );
+            }
+            if chunk_count == 0 && reasoning_count == 0 && total_tools == 0 {
+                log::warn!(
+                    "[byop] stream returned 0 content / 0 reasoning / 0 tool_calls — \
+                     上游可能返回空响应(model_id 错? max_tokens 缺? proxy 异常?)"
+                );
+            }
+
+            // 流结束:把累积的 tool_calls 一次性发出。
+            let mut final_messages: Vec<api::Message> = Vec::new();
+            let mut ordered_tool_calls: Vec<ToolCall> = Vec::with_capacity(tool_bufs.len());
+            for call_id in tool_order {
+                if let Some(call) = tool_bufs.remove(&call_id) {
+                    ordered_tool_calls.push(call);
+                }
+            }
+            let mut unordered_tool_calls: Vec<ToolCall> = tool_bufs.into_values().collect();
+            if !unordered_tool_calls.is_empty() {
+                // 正常路径下 ChunkArgs / End 两处都会同步维护 `tool_order`,所以走到这里
+                // `tool_bufs` 应为空。仅在 provider 异常(例如 captured_content 与 ChunkArgs
+                // 互相缺失某 call_id) 才会命中此 fallback。dict-sort 能保证 OpenAI 兼容
+                // 路径 `tool_calls[]` 顺序跨调用稳定(不漂移 cache prefix),但应告警。
+                log::warn!(
+                    "[byop] {} tool_calls fell through to dict-sort fallback — \
+                     provider inconsistency between ChunkArgs and captured_content; \
+                     call_ids={:?}",
+                    unordered_tool_calls.len(),
+                    unordered_tool_calls.iter().map(|t| t.call_id.as_str()).collect::<Vec<_>>(),
+                );
+            }
+            unordered_tool_calls.sort_by(|a, b| a.call_id.cmp(&b.call_id));
+            ordered_tool_calls.extend(unordered_tool_calls);
+            for call in ordered_tool_calls {
+                // 诊断:dump 模型实际发的 tool_call raw payload
+                // (call_id / fn_name / fn_arguments JSON 原文 + 类型标注),
+                // 便于核对模型是否按 schema 出入参(常见问题:bool 字段被字符串化、
+                // 数字被加引号、嵌套对象塌成字符串等)。
+                // debug 级:只在排查 schema 问题时开 RUST_LOG=debug,平时不污染 INFO。
+                // info 级保留一行不带 args 的简短摘要,便于看流式时序。
+                log::info!(
+                    "[byop] tool_call_in: name={} call_id={}",
+                    call.fn_name,
+                    call.call_id,
+                );
+                if log::log_enabled!(log::Level::Debug) {
+                    let args_repr = if call.fn_arguments.is_string() {
+                        format!("string({:?})", call.fn_arguments.as_str().unwrap_or(""))
+                    } else {
+                        format!(
+                            "{}({})",
+                            match &call.fn_arguments {
+                                Value::Object(_) => "object",
+                                Value::Array(_) => "array",
+                                Value::Bool(_) => "bool",
+                                Value::Number(_) => "number",
+                                Value::Null => "null",
+                                Value::String(_) => "string",
+                            },
+                            call.fn_arguments
+                        )
+                    };
+                    log::debug!(
+                        "[byop] tool_call_in_args: name={} call_id={} args={}",
+                        call.fn_name,
+                        call.call_id,
+                        args_repr,
+                    );
+                }
+
+                // Zap BYOP todowrite 拦截:不映射到 protobuf executor,合成
+                // `Message::UpdateTodos` 直接写 conversation.todo_lists 触发 chip + popup
+                // UI(对齐 server-side ClientAction::AddMessagesToTask::UpdateTodos 路径)。
+                // 然后追加 carrier ToolCall + ToolCallResult 给模型 unblock。
+                if call.fn_name == tools::todowrite::TOOL_NAME {
+                    let args_str = if call.fn_arguments.is_string() {
+                        call.fn_arguments.as_str().unwrap_or("").to_owned()
+                    } else {
+                        call.fn_arguments.to_string()
+                    };
+
+                    match tools::todowrite::build_update_todos_messages(
+                        &args_str,
+                        &current_task_id,
+                        &request_id,
+                    ) {
+                        Ok(todo_msgs) if !todo_msgs.is_empty() => {
+                            // 直接 yield UpdateTodos 让 UI 实时更新 chip。
+                            // 走 AddMessagesToTask:apply_client_action 路径会
+                            // 命中 Message::UpdateTodos 分支 → update_todo_list_from_todo_op
+                            // → emit BlocklistAIHistoryEvent::UpdatedTodoList,UI 自动刷新。
+                            yield Ok(make_add_messages_event(&current_task_id, todo_msgs));
+                            let result_payload =
+                                tools::todowrite::success_result_to_json("todo list updated");
+                            let result_content = serde_json::to_string(&result_payload)
+                                .unwrap_or_else(|_| r#"{"status":"ok"}"#.to_owned());
+                            final_messages.push(make_tool_call_carrier_message(
                                 &current_task_id,
                                 &request_id,
                                 &call.call_id,
-                                parsed,
-                            );
-                            placeholder.id = msg_id.clone();
-                            tool_msg_ids.insert(call.call_id.clone(), msg_id);
-                            tool_last_update.insert(
-                                call.call_id.clone(),
-                                Instant::now(),
-                            );
-                            yield Ok(make_add_messages_event(
+                                &call.fn_name,
+                                &args_str,
+                            ));
+                            final_messages.push(make_tool_call_result_message(
                                 &current_task_id,
-                                vec![placeholder],
+                                &request_id,
+                                call.call_id.clone(),
+                                result_content,
                             ));
                         }
-                        // 首帧 parse 失败(args 还不完整 / 未知工具):暂不 emit,
-                        // 等下次 chunk 再尝试或 End 时走老路径,避免视觉抖动。
-                    }
-                    // 同一 call_id 多次 chunk:后到的覆盖(genai 已合并 args)。
-                    if !tool_bufs.contains_key(&call.call_id) {
-                        tool_order.push(call.call_id.clone());
-                    }
-                    tool_bufs.insert(call.call_id.clone(), call);
-                }
-                ChatStreamEvent::End(end) => {
-                    end_count += 1;
-                    // genai >= 0.4.0 的 captured_content 含 tool_calls。
-                    // 优先用 captured_content 里的 tool_calls(更完整),
-                    // 否则用 streaming 中累积的 tool_bufs。
-                    if let Some(content) = end.captured_content.as_ref() {
-                        if let Some(text) = content.first_text() {
-                            if !text.is_empty() {
-                                captured_assistant_text = Some(text.to_owned());
-                            }
+                        Ok(_) => {
+                            // 空 todos 数组:不 emit UpdateTodos,但仍要给模型 result
+                            // 否则下一轮 chat 会卡(模型等 tool_call_id 的 result)。
+                            let result_payload = tools::todowrite::success_result_to_json("no todos");
+                            let result_content = serde_json::to_string(&result_payload)
+                                .unwrap_or_else(|_| r#"{"status":"ok","message":"no todos"}"#.to_owned());
+                            final_messages.push(make_tool_call_carrier_message(
+                                &current_task_id,
+                                &request_id,
+                                &call.call_id,
+                                &call.fn_name,
+                                &args_str,
+                            ));
+                            final_messages.push(make_tool_call_result_message(
+                                &current_task_id,
+                                &request_id,
+                                call.call_id.clone(),
+                                result_content,
+                            ));
                         }
-                        let mut captured_order: Vec<String> = Vec::new();
-                        for call in content.tool_calls() {
-                            if !captured_order.contains(&call.call_id) {
-                                captured_order.push(call.call_id.clone());
-                            }
-                            tool_bufs.insert(call.call_id.clone(), call.clone());
-                        }
-                        if !captured_order.is_empty() {
-                            for call_id in &tool_order {
-                                if !captured_order.contains(call_id) {
-                                    captured_order.push(call_id.clone());
-                                }
-                            }
-                            tool_order = captured_order;
-                        }
-                    }
-                    if let Some(usage) = end.captured_usage.as_ref() {
-                        // 多次 End 取最大值兜底(理论上单次 stream 只有一次 End)。
-                        if let Some(p) = usage.prompt_tokens {
-                            captured_prompt_tokens = captured_prompt_tokens.max(p);
-                        }
-                        if let Some(c) = usage.completion_tokens {
-                            captured_completion_tokens = captured_completion_tokens.max(c);
-                        }
-                        // P0-6 prompt cache 命中率监控:Anthropic / OpenAI / Gemini 在
-                        // `prompt_tokens_details` 中分别返回 `cache_read_input_tokens`
-                        // (Anthropic) / `cached_tokens`(OpenAI) / `cachedContentTokenCount`
-                        // (Gemini)。genai 已统一映射到 `cached_tokens`。
-                        // 同样 `cache_creation_tokens` 仅 Anthropic 提供(写入计费提示)。
-                        // 多次 End 取最大值兜底,语义同 prompt/completion。
-                        if let Some(details) = usage.prompt_tokens_details.as_ref() {
-                            if let Some(r) = details.cached_tokens {
-                                captured_cache_read_tokens =
-                                    captured_cache_read_tokens.max(r);
-                            }
-                            if let Some(w) = details.cache_creation_tokens {
-                                captured_cache_create_tokens =
-                                    captured_cache_create_tokens.max(w);
-                            }
+                        Err(e) => {
+                            // args 解析失败:跟 from_args 失败一样,emit error tool_result。
+                            log::warn!(
+                                "[byop] todowrite args parse failed: call_id={} err={e:#}",
+                                call.call_id
+                            );
+                            let error_payload = tools::todowrite::invalid_arguments_result_to_json(
+                                e.to_string(),
+                                &args_str,
+                            );
+                            let error_content = serde_json::to_string(&error_payload)
+                                .unwrap_or_else(|_| r#"{"error":"invalid_arguments"}"#.to_owned());
+                            final_messages.push(make_tool_call_carrier_message(
+                                &current_task_id,
+                                &request_id,
+                                &call.call_id,
+                                &call.fn_name,
+                                &args_str,
+                            ));
+                            final_messages.push(make_tool_call_result_message(
+                                &current_task_id,
+                                &request_id,
+                                call.call_id.clone(),
+                                error_content,
+                            ));
                         }
                     }
-                }
-                _ => {
-                    other_count += 1;
-                    // ThoughtSignatureChunk 等暂不处理(Gemini 3 thoughts 需要回传给后续轮次,
-                    // 当前 BYOP 不持久化 thought_signatures,接受降级)
-                }
-            }
-        }
-
-        // Zap:content→tool 提取 fallback 只对 Ollama 生效,与 :1412 的历史过滤对称——
-        // 云端 provider(OpenAI/Anthropic/...)的正文如果恰好长得像 tool JSON(比如模型在
-        // 讲解一段 JSON 示例),不应该被误当成真实 ToolCall 执行。
-        if tool_bufs.is_empty() && api_type == AgentProviderApiType::Ollama {
-            let extract_sources: [&str; 2] = [
-                streamed_assistant_text.as_str(),
-                captured_assistant_text.as_deref().unwrap_or(""),
-            ];
-            let mut parsed_any_text = false;
-            for text in extract_sources.into_iter().filter(|t| !t.is_empty()) {
-                parsed_any_text = true;
-                let extracted = super::content_tool_calls::extract_tool_calls_from_assistant_text(
-                    text,
-                    &tool_names_for_extract,
-                );
-                if extracted.is_empty() {
                     continue;
                 }
-                log::info!(
-                    "[byop] content_tool_extract: found={} names={:?} source_len={}",
-                    extracted.len(),
-                    extracted
-                        .iter()
-                        .map(|call| call.fn_name.as_str())
-                        .collect::<Vec<_>>(),
-                    text.len()
-                );
-                for call in extracted {
-                    let call_id = call.call_id.clone();
-                    if !tool_bufs.contains_key(&call_id) {
-                        tool_order.push(call_id.clone());
-                    }
-                    tool_bufs.insert(call_id, call);
-                }
-                break;
-            }
-            if tool_bufs.is_empty() && parsed_any_text {
-                let preview: String = streamed_assistant_text.chars().take(240).collect();
-                log::info!(
-                    "[byop] content_tool_extract: no tools parsed (streamed={}B captured={}B) \
-                     preview={preview:?}",
-                    streamed_assistant_text.len(),
-                    captured_assistant_text.as_ref().map(|t| t.len()).unwrap_or(0),
-                );
-            } else if tool_bufs.is_empty() {
-                log::warn!(
-                    "[byop] content_tool_extract: skipped — no assistant text in stream \
-                     (chunks={chunk_count} reasoning={reasoning_count})"
-                );
-            }
-        }
 
-        // 流统计 INFO log。chunk_count=0 && tool_count=0 时上游返回为空,
-        // 大概率是 model_id 不被识别 / max_tokens 缺失 / Anthropic API 兼容代理返回 200 但 body 空。
-        let total_tools = tool_bufs.len();
-        log::info!(
-            "[byop] stream stats: start={start_count} chunks={chunk_count} ({chunk_bytes}B) \
-             reasoning={reasoning_count} ({reasoning_bytes}B) native_tool_chunks={tool_chunk_count} \
-             ends={end_count} other={other_count} captured_tools={total_tools}"
-        );
-        // P0-6 prompt cache 命中率日志(只在 provider 返回 cache 字段时打)。
-        // ratio = cache_read / (prompt_tokens.max(1)) 表示本轮 input 中有多少比例直接
-        // 命中了缓存。create > 0 表示本轮有 cache write,write 价 ≈ 1.25x base(5m)或
-        // 2x base(1h)。read 价 ≈ 0.1x base,长期看只要 ≥ 1 次复用就回本。
-        // 用 ratio 判定 P0 优化是否生效:同一对话第 2+ 轮应当看到 ratio 显著上升。
-        //
-        // **P2-16**:额外拼一个 `compaction=` 标识。压缩本身会重写历史使 messages
-        // prefix 跨压缩之前后不一致 → 压缩后首轮必然 cache miss。在日志里输出该
-        // 信号让后期分析(`script/analyze-prompt-cache.ps1`)能区分“正常 miss”与
-        // “压缩导致 miss”,避免误伤。
-        if captured_cache_read_tokens > 0 || captured_cache_create_tokens > 0 {
-            let denom = captured_prompt_tokens.max(1);
-            let read_ratio = captured_cache_read_tokens as f32 / denom as f32;
-            let create_ratio = captured_cache_create_tokens as f32 / denom as f32;
-            // 压缩状态:none → 未启用 / inactive → 启用但本轮未变化 /
-            // active(已 hide 的 message id 个数) → 本轮走了压缩路径。
-            let compaction_label = match params.compaction_state.as_ref() {
-                None => "none".to_owned(),
-                Some(s) => {
-                    let hidden = s.hidden_message_ids().len();
-                    if hidden == 0 {
-                        "inactive".to_owned()
+                // Zap BYOP web 工具拦截:webfetch / websearch 不映射到 protobuf
+                // executor variant,在这里直接跑本地 HTTP,合成 (carrier ToolCall,
+                // ToolCallResult) 一对消息,绕开 parse_incoming_tool_call。
+                //
+                // UI:对齐 cloud 模式,前后各 emit 一条 `Message::WebSearch` /
+                // `Message::WebFetch` 状态消息,触发 inline_action `WebSearchView` /
+                // `WebFetchView` 渲染:Searching/Fetching loading 卡片 → Success(URL 列表)
+                // / Error 折叠卡。这两条不进 final_messages,直接 yield 让 UI 实时更新;
+                // carrier + result 仍走 final_messages 给下一轮模型推理用。
+                if call.fn_name == tools::webfetch::TOOL_NAME
+                    || call.fn_name == tools::websearch::TOOL_NAME
+                {
+                    let args_str = if call.fn_arguments.is_string() {
+                        call.fn_arguments.as_str().unwrap_or("").to_owned()
                     } else {
-                        format!("active(hidden={hidden})")
-                    }
+                        call.fn_arguments.to_string()
+                    };
+                    let is_search = call.fn_name == tools::websearch::TOOL_NAME;
+
+                    // 预解析 args 抽 query / url 给 UI loading 卡。args 解析失败也要 emit
+                    // (用空字段兜底),保证 UI 至少看到一帧 loading,后续 dispatch
+                    // 仍会返回 invalid_arguments → 切到 Error 卡。
+                    let preview_query = if is_search {
+                        serde_json::from_str::<tools::web_runtime::SearchToolArgs>(&args_str)
+                            .map(|a| a.query)
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    let preview_urls: Vec<String> = if !is_search {
+                        serde_json::from_str::<tools::web_runtime::FetchArgs>(&args_str)
+                            .map(|a| vec![a.url])
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Searching/Fetching loading 帧与最终 Success/Error 帧必须共用同一个
+                    // message.id —— `block.rs::handle_web_search_messages` 按 id 复用
+                    // WebSearchView,id 不同会创建两张独立卡。
+                    let web_msg_id = Uuid::new_v4().to_string();
+                    let mut loading_msg = if is_search {
+                        make_web_search_searching_message(
+                            &current_task_id,
+                            &request_id,
+                            preview_query.clone(),
+                        )
+                    } else {
+                        make_web_fetch_fetching_message(
+                            &current_task_id,
+                            &request_id,
+                            preview_urls.clone(),
+                        )
+                    };
+                    loading_msg.id = web_msg_id.clone();
+                    yield Ok(make_add_messages_event(&current_task_id, vec![loading_msg]));
+
+                    let result_json = dispatch_byop_web_tool(&call.fn_name, &args_str).await;
+
+                    let mut done_msg = if is_search {
+                        make_web_search_status_from_result(
+                            &current_task_id,
+                            &request_id,
+                            &preview_query,
+                            &result_json,
+                        )
+                    } else {
+                        make_web_fetch_status_from_result(
+                            &current_task_id,
+                            &request_id,
+                            &preview_urls,
+                            &result_json,
+                        )
+                    };
+                    done_msg.id = web_msg_id;
+                    // 第二帧不能再用 AddMessagesToTask —— 那会往 task.messages 追加第二条
+                    // 同 id 记录,`output.rs::WebSearch` 渲染分支按 message 数量 add_child,
+                    // 显示成两张并排卡。改用 UpdateTaskMessage + FieldMask:`task::upsert_message`
+                    // 找到同 id 现有 message 后走 FieldMaskOperation::update 原地合并,
+                    // task.messages 仍只有一条 → UI 一张卡 set_status 切换。
+                    let mask_path = if is_search { "web_search" } else { "web_fetch" };
+                    yield Ok(make_update_message_event(
+                        &current_task_id,
+                        done_msg,
+                        vec![mask_path.to_owned()],
+                    ));
+
+                    let result_content = serde_json::to_string(&result_json)
+                        .unwrap_or_else(|_| r#"{"status":"serialize_error"}"#.to_owned());
+                    final_messages.push(make_tool_call_carrier_message(
+                        &current_task_id,
+                        &request_id,
+                        &call.call_id,
+                        &call.fn_name,
+                        &args_str,
+                    ));
+                    final_messages.push(make_tool_call_result_message(
+                        &current_task_id,
+                        &request_id,
+                        call.call_id.clone(),
+                        result_content,
+                    ));
+                    continue;
                 }
-            };
-            log::info!(
-                "[byop-cache] prompt_tokens={captured_prompt_tokens} \
-                 cache_read={captured_cache_read_tokens} ({:.1}%) \
-                 cache_create={captured_cache_create_tokens} ({:.1}%) \
-                 model={model_id} compaction={compaction_label}",
-                read_ratio * 100.0,
-                create_ratio * 100.0,
-            );
-        }
-        if chunk_count == 0 && reasoning_count == 0 && total_tools == 0 {
-            log::warn!(
-                "[byop] stream returned 0 content / 0 reasoning / 0 tool_calls — \
-                 上游可能返回空响应(model_id 错? max_tokens 缺? proxy 异常?)"
-            );
-        }
 
-        // 流结束:把累积的 tool_calls 一次性发出。
-        let mut final_messages: Vec<api::Message> = Vec::new();
-        let mut ordered_tool_calls: Vec<ToolCall> = Vec::with_capacity(tool_bufs.len());
-        for call_id in tool_order {
-            if let Some(call) = tool_bufs.remove(&call_id) {
-                ordered_tool_calls.push(call);
-            }
-        }
-        let mut unordered_tool_calls: Vec<ToolCall> = tool_bufs.into_values().collect();
-        if !unordered_tool_calls.is_empty() {
-            // 正常路径下 ChunkArgs / End 两处都会同步维护 `tool_order`,所以走到这里
-            // `tool_bufs` 应为空。仅在 provider 异常(例如 captured_content 与 ChunkArgs
-            // 互相缺失某 call_id) 才会命中此 fallback。dict-sort 能保证 OpenAI 兼容
-            // 路径 `tool_calls[]` 顺序跨调用稳定(不漂移 cache prefix),但应告警。
-            log::warn!(
-                "[byop] {} tool_calls fell through to dict-sort fallback — \
-                 provider inconsistency between ChunkArgs and captured_content; \
-                 call_ids={:?}",
-                unordered_tool_calls.len(),
-                unordered_tool_calls.iter().map(|t| t.call_id.as_str()).collect::<Vec<_>>(),
-            );
-        }
-        unordered_tool_calls.sort_by(|a, b| a.call_id.cmp(&b.call_id));
-        ordered_tool_calls.extend(unordered_tool_calls);
-        for call in ordered_tool_calls {
-            // 诊断:dump 模型实际发的 tool_call raw payload
-            // (call_id / fn_name / fn_arguments JSON 原文 + 类型标注),
-            // 便于核对模型是否按 schema 出入参(常见问题:bool 字段被字符串化、
-            // 数字被加引号、嵌套对象塌成字符串等)。
-            // debug 级:只在排查 schema 问题时开 RUST_LOG=debug,平时不污染 INFO。
-            // info 级保留一行不带 args 的简短摘要,便于看流式时序。
-            log::info!(
-                "[byop] tool_call_in: name={} call_id={}",
-                call.fn_name,
-                call.call_id,
-            );
-            if log::log_enabled!(log::Level::Debug) {
-                let args_repr = if call.fn_arguments.is_string() {
-                    format!("string({:?})", call.fn_arguments.as_str().unwrap_or(""))
-                } else {
-                    format!(
-                        "{}({})",
-                        match &call.fn_arguments {
-                            Value::Object(_) => "object",
-                            Value::Array(_) => "array",
-                            Value::Bool(_) => "bool",
-                            Value::Number(_) => "number",
-                            Value::Null => "null",
-                            Value::String(_) => "string",
-                        },
-                        call.fn_arguments
-                    )
-                };
-                log::debug!(
-                    "[byop] tool_call_in_args: name={} call_id={} args={}",
-                    call.fn_name,
-                    call.call_id,
-                    args_repr,
-                );
-            }
-
-            // Zap BYOP todowrite 拦截:不映射到 protobuf executor,合成
-            // `Message::UpdateTodos` 直接写 conversation.todo_lists 触发 chip + popup
-            // UI(对齐 server-side ClientAction::AddMessagesToTask::UpdateTodos 路径)。
-            // 然后追加 carrier ToolCall + ToolCallResult 给模型 unblock。
-            if call.fn_name == tools::todowrite::TOOL_NAME {
-                let args_str = if call.fn_arguments.is_string() {
-                    call.fn_arguments.as_str().unwrap_or("").to_owned()
-                } else {
-                    call.fn_arguments.to_string()
-                };
-
-                match tools::todowrite::build_update_todos_messages(
-                    &args_str,
-                    &current_task_id,
-                    &request_id,
-                ) {
-                    Ok(todo_msgs) if !todo_msgs.is_empty() => {
-                        // 直接 yield UpdateTodos 让 UI 实时更新 chip。
-                        // 走 AddMessagesToTask:apply_client_action 路径会
-                        // 命中 Message::UpdateTodos 分支 → update_todo_list_from_todo_op
-                        // → emit BlocklistAIHistoryEvent::UpdatedTodoList,UI 自动刷新。
-                        yield Ok(make_add_messages_event(&current_task_id, todo_msgs));
-                        let result_payload =
-                            tools::todowrite::success_result_to_json("todo list updated");
-                        let result_content = serde_json::to_string(&result_payload)
-                            .unwrap_or_else(|_| r#"{"status":"ok"}"#.to_owned());
-                        final_messages.push(make_tool_call_carrier_message(
-                            &current_task_id,
-                            &request_id,
-                            &call.call_id,
-                            &call.fn_name,
-                            &args_str,
-                        ));
-                        final_messages.push(make_tool_call_result_message(
-                            &current_task_id,
-                            &request_id,
-                            call.call_id.clone(),
-                            result_content,
-                        ));
-                    }
-                    Ok(_) => {
-                        // 空 todos 数组:不 emit UpdateTodos,但仍要给模型 result
-                        // 否则下一轮 chat 会卡(模型等 tool_call_id 的 result)。
-                        let result_payload = tools::todowrite::success_result_to_json("no todos");
-                        let result_content = serde_json::to_string(&result_payload)
-                            .unwrap_or_else(|_| r#"{"status":"ok","message":"no todos"}"#.to_owned());
-                        final_messages.push(make_tool_call_carrier_message(
-                            &current_task_id,
-                            &request_id,
-                            &call.call_id,
-                            &call.fn_name,
-                            &args_str,
-                        ));
-                        final_messages.push(make_tool_call_result_message(
-                            &current_task_id,
-                            &request_id,
-                            call.call_id.clone(),
-                            result_content,
-                        ));
+                match parse_incoming_tool_call(&call, mcp_context.as_ref()) {
+                    Ok(warp_tool) => {
+                        // 如果 ToolCallChunk 阶段已经 emit 过占位卡(同 call_id),
+                        // 改用 update_message 原地刷新为最终 args(覆盖 chunk 中可能后到
+                        // 的 args delta)。占位与终帧共用同一 message.id,
+                        // task::upsert_message 走 FieldMaskOperation::update,
+                        // task.messages 仍只有一条 → UI 一张卡 in-place 刷新,不双卡。
+                        if let Some(msg_id) = tool_msg_ids.get(&call.call_id).cloned() {
+                            let mut updated = make_tool_call_message(
+                                &current_task_id,
+                                &request_id,
+                                &call.call_id,
+                                warp_tool,
+                            );
+                            updated.id = msg_id;
+                            yield Ok(make_update_message_event(
+                                &current_task_id,
+                                updated,
+                                vec!["tool_call".to_owned()],
+                            ));
+                        } else {
+                            final_messages.push(make_tool_call_message(
+                                &current_task_id,
+                                &request_id,
+                                &call.call_id,
+                                warp_tool,
+                            ));
+                        }
                     }
                     Err(e) => {
-                        // args 解析失败:跟 from_args 失败一样,emit error tool_result。
+                        // 关键:不再把 from_args 失败吞成纯文本(原实现:emit AgentOutput),
+                        // 因为模型那一轮以为自己调了 tool 在等 result,看到一段中文 assistant 文字
+                        // 完全不知道是参数类型错,无法定向修正重试。
+                        // 改成 emit 一对 ToolCall(carrier) + ToolCallResult(error JSON),
+                        // 让模型在下一轮看到标准 tool_result error,可以按惯例改 args 重试或换工具。
+                        //
+                        // ToolCall 的 `tool` oneof 留 None(没有合适的结构化 variant),原始
+                        // fn_name + args_str 通过 server_message_data 携带,
+                        // serialize_outgoing_tool_call 的 carrier 分支会优先还原。
+                        let args_str = if call.fn_arguments.is_string() {
+                            call.fn_arguments.as_str().unwrap_or("").to_owned()
+                        } else {
+                            call.fn_arguments.to_string()
+                        };
                         log::warn!(
-                            "[byop] todowrite args parse failed: call_id={} err={e:#}",
+                            "[byop] tool_call parse failed → emit synthetic error tool_result: \
+                             tool={} call_id={} err={e:#}",
+                            call.fn_name,
                             call.call_id
                         );
-                        let error_payload = tools::todowrite::invalid_arguments_result_to_json(
-                            e.to_string(),
-                            &args_str,
-                        );
+                        let error_payload = serde_json::json!({
+                            "error": "invalid_arguments",
+                            "detail": e.to_string(),
+                            "tool": call.fn_name,
+                            "received_args": &args_str,
+                            "hint": "Arguments did not match the tool's JSON Schema. \
+                                     Re-emit the tool call with corrected types / required fields, \
+                                     or pick a different tool.",
+                        });
                         let error_content = serde_json::to_string(&error_payload)
                             .unwrap_or_else(|_| r#"{"error":"invalid_arguments"}"#.to_owned());
                         final_messages.push(make_tool_call_carrier_message(
@@ -4302,225 +4757,41 @@ pub async fn generate_byop_output(
                         ));
                     }
                 }
-                continue;
+            }
+            if !final_messages.is_empty() {
+                yield Ok(make_add_messages_event(&current_task_id, final_messages));
             }
 
-            // Zap BYOP web 工具拦截:webfetch / websearch 不映射到 protobuf
-            // executor variant,在这里直接跑本地 HTTP,合成 (carrier ToolCall,
-            // ToolCallResult) 一对消息,绕开 parse_incoming_tool_call。
-            //
-            // UI:对齐 cloud 模式,前后各 emit 一条 `Message::WebSearch` /
-            // `Message::WebFetch` 状态消息,触发 inline_action `WebSearchView` /
-            // `WebFetchView` 渲染:Searching/Fetching loading 卡片 → Success(URL 列表)
-            // / Error 折叠卡。这两条不进 final_messages,直接 yield 让 UI 实时更新;
-            // carrier + result 仍走 final_messages 给下一轮模型推理用。
-            if call.fn_name == tools::webfetch::TOOL_NAME
-                || call.fn_name == tools::websearch::TOOL_NAME
-            {
-                let args_str = if call.fn_arguments.is_string() {
-                    call.fn_arguments.as_str().unwrap_or("").to_owned()
-                } else {
-                    call.fn_arguments.to_string()
-                };
-                let is_search = call.fn_name == tools::websearch::TOOL_NAME;
-
-                // 预解析 args 抽 query / url 给 UI loading 卡。args 解析失败也要 emit
-                // (用空字段兜底),保证 UI 至少看到一帧 loading,后续 dispatch
-                // 仍会返回 invalid_arguments → 切到 Error 卡。
-                let preview_query = if is_search {
-                    serde_json::from_str::<tools::web_runtime::SearchToolArgs>(&args_str)
-                        .map(|a| a.query)
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                let preview_urls: Vec<String> = if !is_search {
-                    serde_json::from_str::<tools::web_runtime::FetchArgs>(&args_str)
-                        .map(|a| vec![a.url])
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-
-                // Searching/Fetching loading 帧与最终 Success/Error 帧必须共用同一个
-                // message.id —— `block.rs::handle_web_search_messages` 按 id 复用
-                // WebSearchView,id 不同会创建两张独立卡。
-                let web_msg_id = Uuid::new_v4().to_string();
-                let mut loading_msg = if is_search {
-                    make_web_search_searching_message(
-                        &current_task_id,
-                        &request_id,
-                        preview_query.clone(),
-                    )
-                } else {
-                    make_web_fetch_fetching_message(
-                        &current_task_id,
-                        &request_id,
-                        preview_urls.clone(),
-                    )
-                };
-                loading_msg.id = web_msg_id.clone();
-                yield Ok(make_add_messages_event(&current_task_id, vec![loading_msg]));
-
-                let result_json = dispatch_byop_web_tool(&call.fn_name, &args_str).await;
-
-                let mut done_msg = if is_search {
-                    make_web_search_status_from_result(
-                        &current_task_id,
-                        &request_id,
-                        &preview_query,
-                        &result_json,
-                    )
-                } else {
-                    make_web_fetch_status_from_result(
-                        &current_task_id,
-                        &request_id,
-                        &preview_urls,
-                        &result_json,
-                    )
-                };
-                done_msg.id = web_msg_id;
-                // 第二帧不能再用 AddMessagesToTask —— 那会往 task.messages 追加第二条
-                // 同 id 记录,`output.rs::WebSearch` 渲染分支按 message 数量 add_child,
-                // 显示成两张并排卡。改用 UpdateTaskMessage + FieldMask:`task::upsert_message`
-                // 找到同 id 现有 message 后走 FieldMaskOperation::update 原地合并,
-                // task.messages 仍只有一条 → UI 一张卡 set_status 切换。
-                let mask_path = if is_search { "web_search" } else { "web_fetch" };
-                yield Ok(make_update_message_event(
-                    &current_task_id,
-                    done_msg,
-                    vec![mask_path.to_owned()],
-                ));
-
-                let result_content = serde_json::to_string(&result_json)
-                    .unwrap_or_else(|_| r#"{"status":"serialize_error"}"#.to_owned());
-                final_messages.push(make_tool_call_carrier_message(
-                    &current_task_id,
-                    &request_id,
-                    &call.call_id,
-                    &call.fn_name,
-                    &args_str,
-                ));
-                final_messages.push(make_tool_call_result_message(
-                    &current_task_id,
-                    &request_id,
-                    call.call_id.clone(),
-                    result_content,
-                ));
-                continue;
-            }
-
-            match parse_incoming_tool_call(&call, mcp_context.as_ref()) {
-                Ok(warp_tool) => {
-                    // 如果 ToolCallChunk 阶段已经 emit 过占位卡(同 call_id),
-                    // 改用 update_message 原地刷新为最终 args(覆盖 chunk 中可能后到
-                    // 的 args delta)。占位与终帧共用同一 message.id,
-                    // task::upsert_message 走 FieldMaskOperation::update,
-                    // task.messages 仍只有一条 → UI 一张卡 in-place 刷新,不双卡。
-                    if let Some(msg_id) = tool_msg_ids.get(&call.call_id).cloned() {
-                        let mut updated = make_tool_call_message(
-                            &current_task_id,
-                            &request_id,
-                            &call.call_id,
-                            warp_tool,
-                        );
-                        updated.id = msg_id;
-                        yield Ok(make_update_message_event(
-                            &current_task_id,
-                            updated,
-                            vec!["tool_call".to_owned()],
-                        ));
-                    } else {
-                        final_messages.push(make_tool_call_message(
-                            &current_task_id,
-                            &request_id,
-                            &call.call_id,
-                            warp_tool,
-                        ));
-                    }
+            // 把 captured token usage 折算成 ConversationUsageMetadata.context_window_usage
+            // 注入 StreamFinished — controller 的 handle_response_stream_finished 会把它写到
+            // conversation.conversation_usage_metadata,footer 监听 UpdatedStreamingExchange/
+            // AppendedExchange 事件即在每轮末实时刷新 "X% context remaining" 工具提示。
+            let usage_metadata = context_window.and_then(|cw| {
+                if cw == 0 || (captured_prompt_tokens == 0 && captured_completion_tokens == 0) {
+                    return None;
                 }
-                Err(e) => {
-                    // 关键:不再把 from_args 失败吞成纯文本(原实现:emit AgentOutput),
-                    // 因为模型那一轮以为自己调了 tool 在等 result,看到一段中文 assistant 文字
-                    // 完全不知道是参数类型错,无法定向修正重试。
-                    // 改成 emit 一对 ToolCall(carrier) + ToolCallResult(error JSON),
-                    // 让模型在下一轮看到标准 tool_result error,可以按惯例改 args 重试或换工具。
-                    //
-                    // ToolCall 的 `tool` oneof 留 None(没有合适的结构化 variant),原始
-                    // fn_name + args_str 通过 server_message_data 携带,
-                    // serialize_outgoing_tool_call 的 carrier 分支会优先还原。
-                    let args_str = if call.fn_arguments.is_string() {
-                        call.fn_arguments.as_str().unwrap_or("").to_owned()
-                    } else {
-                        call.fn_arguments.to_string()
-                    };
-                    log::warn!(
-                        "[byop] tool_call parse failed → emit synthetic error tool_result: \
-                         tool={} call_id={} err={e:#}",
-                        call.fn_name,
-                        call.call_id
-                    );
-                    let error_payload = serde_json::json!({
-                        "error": "invalid_arguments",
-                        "detail": e.to_string(),
-                        "tool": call.fn_name,
-                        "received_args": &args_str,
-                        "hint": "Arguments did not match the tool's JSON Schema. \
-                                 Re-emit the tool call with corrected types / required fields, \
-                                 or pick a different tool.",
-                    });
-                    let error_content = serde_json::to_string(&error_payload)
-                        .unwrap_or_else(|_| r#"{"error":"invalid_arguments"}"#.to_owned());
-                    final_messages.push(make_tool_call_carrier_message(
-                        &current_task_id,
-                        &request_id,
-                        &call.call_id,
-                        &call.fn_name,
-                        &args_str,
-                    ));
-                    final_messages.push(make_tool_call_result_message(
-                        &current_task_id,
-                        &request_id,
-                        call.call_id.clone(),
-                        error_content,
-                    ));
-                }
-            }
-        }
-        if !final_messages.is_empty() {
-            yield Ok(make_add_messages_event(&current_task_id, final_messages));
-        }
-
-        // 把 captured token usage 折算成 ConversationUsageMetadata.context_window_usage
-        // 注入 StreamFinished — controller 的 handle_response_stream_finished 会把它写到
-        // conversation.conversation_usage_metadata,footer 监听 UpdatedStreamingExchange/
-        // AppendedExchange 事件即在每轮末实时刷新 "X% context remaining" 工具提示。
-        let usage_metadata = context_window.and_then(|cw| {
-            if cw == 0 || (captured_prompt_tokens == 0 && captured_completion_tokens == 0) {
-                return None;
-            }
-            let used = (captured_prompt_tokens + captured_completion_tokens).max(0) as f32;
-            let pct = (used / cw as f32).clamp(0.0, 1.0);
-            log::info!(
-                "[byop] context usage: prompt={} completion={} window={} → {:.1}%",
-                captured_prompt_tokens,
-                captured_completion_tokens,
-                cw,
-                pct * 100.0
-            );
-            Some(api::response_event::stream_finished::ConversationUsageMetadata {
-                context_window_usage: pct,
-                summarized: false,
-                credits_spent: 0.0,
-                #[allow(deprecated)]
-                token_usage: Vec::new(),
-                tool_usage_metadata: None,
-                warp_token_usage: std::collections::HashMap::new(),
-                byok_token_usage: std::collections::HashMap::new(),
-            })
-        });
-        yield Ok(make_finished_done(usage_metadata));
-    };
+                let used = (captured_prompt_tokens + captured_completion_tokens).max(0) as f32;
+                let pct = (used / cw as f32).clamp(0.0, 1.0);
+                log::info!(
+                    "[byop] context usage: prompt={} completion={} window={} → {:.1}%",
+                    captured_prompt_tokens,
+                    captured_completion_tokens,
+                    cw,
+                    pct * 100.0
+                );
+                Some(api::response_event::stream_finished::ConversationUsageMetadata {
+                    context_window_usage: pct,
+                    summarized: false,
+                    credits_spent: 0.0,
+                    #[allow(deprecated)]
+                    token_usage: Vec::new(),
+                    tool_usage_metadata: None,
+                    warp_token_usage: std::collections::HashMap::new(),
+                    byok_token_usage: std::collections::HashMap::new(),
+                })
+            });
+            yield Ok(make_finished_done(usage_metadata));
+        };
 
     Ok(Box::pin(stream))
 }
@@ -5297,6 +5568,93 @@ fn make_finished_done(
                 request_cost: None,
             },
         )),
+    }
+}
+
+#[cfg(test)]
+mod byop_stream_retry_tests {
+    use super::*;
+    use genai::Error as G;
+    use genai::ModelIden;
+
+    fn http_error(code: u16) -> G {
+        G::HttpError {
+            status: reqwest::StatusCode::from_u16(code).unwrap(),
+            canonical_reason: String::new(),
+            body: String::new(),
+        }
+    }
+
+    fn web_stream_error() -> G {
+        G::WebStream {
+            model_iden: ModelIden::new(AdapterKind::Anthropic, "test-model"),
+            cause: "error sending request for url".to_owned(),
+            error: "connection refused".into(),
+        }
+    }
+
+    #[test]
+    fn transport_errors_are_retryable() {
+        // 用户截图里的那一类：连接层失败，换一次连接就有机会成功。
+        assert!(is_retryable_genai_error(&web_stream_error()));
+    }
+
+    #[test]
+    fn transient_http_statuses_are_retryable() {
+        assert!(is_retryable_genai_error(&http_error(408)));
+        assert!(is_retryable_genai_error(&http_error(429)));
+        assert!(is_retryable_genai_error(&http_error(500)));
+        assert!(is_retryable_genai_error(&http_error(503)));
+    }
+
+    #[test]
+    fn client_error_statuses_are_not_retryable() {
+        // 401 key 错 / 404 模型名错 / 400 请求体非法 —— 重试多少次都一样。
+        assert!(!is_retryable_genai_error(&http_error(400)));
+        assert!(!is_retryable_genai_error(&http_error(401)));
+        assert!(!is_retryable_genai_error(&http_error(404)));
+    }
+
+    #[test]
+    fn auth_and_parse_errors_are_not_retryable() {
+        assert!(!is_retryable_genai_error(&G::RequiresApiKey {
+            model_iden: ModelIden::new(AdapterKind::Anthropic, "m"),
+        }));
+        assert!(!is_retryable_genai_error(&G::Internal("boom".to_owned())));
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_and_is_capped() {
+        // 1s / 2s / 4s / 8s，之后封顶不再增长。抖动使实际值落在 [base, base+250]，
+        // 这里取该区间的中位数近似 base，再断言基准序列。
+        let approximate_base = |attempt: usize| {
+            let millis = retry_backoff(attempt).as_millis();
+            assert!(
+                (1_000u128 << attempt.min(3)..=(1_000u128 << attempt.min(3)) + 250)
+                    .contains(&millis),
+                "attempt {attempt}: {millis}ms 超出预期窗口"
+            );
+            1_000u128 << attempt.min(3)
+        };
+        assert_eq!(approximate_base(0), 1_000);
+        assert_eq!(approximate_base(1), 2_000);
+        assert_eq!(approximate_base(2), 4_000);
+        assert_eq!(approximate_base(3), 8_000);
+        // attempt 远超封顶指数后不再增长。
+        assert_eq!(approximate_base(50), 8_000);
+    }
+
+    #[test]
+    fn backoff_jitter_stays_within_window() {
+        for attempt in 0..8usize {
+            let millis = retry_backoff(attempt).as_millis();
+            let base = 1_000u128 << attempt.min(3);
+            assert!(
+                (base..=base + 250).contains(&millis),
+                "attempt {attempt}: {millis}ms 不在 [{base}, {}] 区间内",
+                base + 250
+            );
+        }
     }
 }
 
