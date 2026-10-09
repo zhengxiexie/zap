@@ -31,7 +31,7 @@ use crate::{
 
 use crate::ai::attachment_utils::attachments_download_dir;
 
-use super::AgentDriverError;
+use super::{command_guard, AgentDriverError};
 
 const TERMINAL_SESSION_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -188,6 +188,62 @@ impl TerminalDriver {
         self.terminal_view.update(ctx, f);
     }
 
+    /// 启动超时兼底：若命令在 [`command_guard::COMMAND_TIMEOUT`] 内未结束，
+    /// 关闭 PTY 并把等待方唤醒，避免本轮永久占用。
+    ///
+    /// 这是静态规则（`command_guard::check_command`）的兼底。静态规则只能拦
+    /// 已知形态，而“卡住”的原因很多：管道未关闭、子进程继承了 TTY、命令
+    /// 形态正常但等不到 EOF…… 对这些未知情况，超时是通用的兼底手段。
+    ///
+    /// 用 `shutdown_pty` 而不是写 Ctrl-C：后者需要 line editor 配合，在
+    /// pending/交互态下不一定生效；关 PTY 则一定能终止命令并让 block 结束。
+    fn start_command_watchdog(&mut self, ctx: &mut ModelContext<Self>) {
+        let driver = ctx.spawner();
+        let timeout = command_guard::COMMAND_TIMEOUT;
+
+        ctx.spawn(
+            async move {
+                warpui::r#async::Timer::after(timeout).await;
+                // 等到点了。若命令已正常结束，`waiting_command` 已被取走，
+                // 后面的操作就是空操作，不会有副作用。
+                log::warn!("[agent] command exceeded {timeout:?}; shutting down PTY");
+let _ = driver
+                    .spawn(move |driver, ctx| {
+                        driver.terminal_view.update(ctx, |terminal, ctx| {
+                            terminal.shutdown_pty(ctx);
+                        });
+                        // 把挂住的命令当作被中断结束，避免调用方永久等待。
+                        if let Some(sender) = driver.waiting_command.take() {
+                            // 130 = 128 + SIGINT，与 Ctrl-C 退出惯例一致，
+                            // 调用方 `is_sigint()` 能识别为“被中断”。
+                            let _ = sender.send(ExitCode::from(130));
+                            // 通知用户：命令超时被强制终止，往往意味着它在等
+                            // 人工输入（密码 / 确认）。不给通知的话，AI 这一轮
+                            // 会直接结束，用户根本不知道发生过什么。
+                            let command = driver
+                                .pending_command_start
+                                .as_ref()
+                                .map(|(cmd, _)| cmd.clone())
+                                .unwrap_or_else(|| "unknown".to_owned());
+                            driver.pending_command_start = None;
+                            driver.terminal_view.update(ctx, |terminal, ctx| {
+                                terminal.maybe_send_ai_command_alert(
+                                    "Zap".to_owned(),
+                                    format!(
+                                        "Oz 的一条命令超过 {} 秒未结束，已强制终止：\n{command}\n它很可能在等待人工输入。",
+                                        command_guard::COMMAND_TIMEOUT.as_secs()
+                                    ),
+                                    ctx,
+                                );
+                            });
+                        }
+                    })
+                    .await;
+            },
+            |_, _, _| {},
+        );
+    }
+
     /// Submit `text` to the active CLI agent on the terminal PTY using the
     /// agent-specific submission strategy.
     ///
@@ -225,12 +281,42 @@ impl TerminalDriver {
             return Err(AgentDriverError::InvalidRuntimeState);
         }
 
+        // 客户端强制规则：交互式 / 需 TTY / 不自行退出的命令一律不进终端。
+        //
+        // 提示词里已经写了“不要运行 git push / ssh”，但那是软约束——LLM 的指令
+        // 遵循是概率性的。这里是硬约束：不合规的命令根本不会下发到 shell，
+        // 因此无论模型多么不听话都不会把会话卡死。
+        if let Err(reason) = command_guard::check_command(command) {
+            log::warn!(
+                "[agent] rejecting command by client-side guard: {:?} ({})",
+                reason,
+                command
+            );
+            // 主动通知：命令被拦下后 AI 虽然会收到错误并自行纠正，但如果流已经
+            // 中断或 UI 没有自动滚动，用户只会看到“卡住”。这里复用与其他
+            // “需要关注”场景相同的通知开关，不引入新设置项。
+            self.terminal_view.update(ctx, |terminal, ctx| {
+                terminal.maybe_send_ai_command_alert(
+                    "Zap".to_owned(),
+                    format!("Oz 的一条命令被客户端规则拦截，需要你关注：\n{command}"),
+                    ctx,
+                );
+            });
+            return Err(AgentDriverError::CommandRejected {
+                reason: reason.model_hint(),
+            });
+        }
+
         let command_string = command.to_string();
         self.terminal_view.update(ctx, |terminal, ctx| {
             self.waiting_command = Some(exit_tx);
             self.pending_command_start = Some((command_string, start_tx));
             terminal.execute_command_or_set_pending(command, ctx);
         });
+
+        // 超时兼底：即使命令形态正常，也可能因未知原因卡住。启动后若命令在
+        // 期限内正常结束，watchdog 到点时 `waiting_command` 已被取走，形同空转。
+        self.start_command_watchdog(ctx);
 
         Ok(async move {
             let block_id = start_rx

@@ -19084,6 +19084,48 @@ impl TerminalView {
         }
     }
 
+/// AI 侧异常（命令被客户端规则拦截 / 命令超时未结束）主动通知用户。
+    ///
+    /// 这类情况**不能**只靠返回错误给模型：一旦流已经中断或 UI 没有自动滚动，
+    /// 用户完全无从察觉命令为何停下，只会看到“一直等着”。
+    ///
+    /// 复用 `NeedsAttention` 触发器，因此和“AI 等你批准”共用同一套通知开关
+    /// （`NotificationsMode::Enabled` + `is_needs_attention_enabled`），
+    /// 不引入新的设置项。未启用时退化为 discovery banner，与密码提示行为一致。
+    pub fn maybe_send_ai_command_alert(
+        &mut self,
+        title: String,
+        body: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let notification_settings = SessionSettings::as_ref(ctx).notifications.value().clone();
+
+        match notification_settings.mode {
+            NotificationsMode::Enabled if notification_settings.is_needs_attention_enabled => {
+                let trigger = NotificationsTrigger::NeedsAttention;
+                let notification_content = trigger.create_notification_content(title, body);
+                ctx.emit(Event::SendNotification(notification_content));
+                send_telemetry_from_ctx!(
+                    TelemetryEvent::NotificationSent {
+                        trigger,
+                        agent_variant: None,
+                    },
+                    ctx
+                );
+            }
+            NotificationsMode::Unset
+                if matches!(
+                    self.inline_banners_state.notifications_discovery_banner,
+                    NotificationsDiscoveryBanner::Unset
+                ) =>
+            {
+                self.inline_banners_state.notifications_discovery_banner =
+                    NotificationsDiscoveryBanner::Triggered(NotificationsTrigger::NeedsAttention);
+            }
+            _ => {}
+        }
+    }
+
     fn handle_input_event(&mut self, event: &InputEvent, ctx: &mut ViewContext<Self>) {
         match event {
             InputEvent::Enter => self.clear_prompt_suggestions(ctx),

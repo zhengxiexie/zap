@@ -66,6 +66,7 @@ use warpui::{
     Entity, ModelContext, ModelHandle, ModelSpawner, SingletonEntity,
 };
 
+pub(crate) mod command_guard;
 pub(crate) mod harness;
 pub(super) mod output;
 pub(crate) mod terminal;
@@ -267,6 +268,11 @@ pub enum AgentDriverError {
     TerminalUnavailable,
     #[error("Invalid runtime state - please file a bug report.")]
     InvalidRuntimeState,
+    /// 命令被客户端强制规则拦截（交互式 / 需 TTY / 不自行退出）。
+    ///
+    /// `reason` 是面向模型的可执行纠正建议，会回传给模型让它自行重试。
+    #[error("Command rejected by client-side policy: {reason}")]
+    CommandRejected { reason: String },
     #[error("Requested MCP server not found: {0}")]
     MCPServerNotFound(uuid::Uuid),
     #[error("Failed to start MCP servers")]
@@ -1518,9 +1524,7 @@ impl AgentDriver {
     fn handle_terminal_driver_event(&mut self, event: &TerminalDriverEvent) {
         match event {
             TerminalDriverEvent::SlowBootstrap => {
-                eprintln!(
-                    "Warning: Terminal session is slow to bootstrap."
-                );
+                eprintln!("Warning: Terminal session is slow to bootstrap.");
             }
         }
     }

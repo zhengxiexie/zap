@@ -20,6 +20,28 @@ For one-shot commands (`ls`, `git status`, `cargo test`, etc.) keep the default 
 - `is_risky=true` — command is destructive (rm -rf, force-push, schema migration, killing processes). Set this so the user gets a more visible confirmation.
 - `uses_pager=true` — command may invoke a pager (less/more/git log). Prefer appending `| cat` to avoid blocking.
 
+# Client-enforced restrictions (hard constraints)
+
+These are **not** style suggestions — the client rejects these commands outright and returns an error without executing them. Unlike everything else in this document, violating them WILL fail.
+
+The following categories are rejected:
+
+- **Interactive commands** — `ssh`, `scp`, `mysql`, `psql`, `sudo`, `gpg`, `pass`, `docker`, `kubectl`, `gh`, `aws`, `az`, …
+- **Git subcommands that require authentication or touch a remote** — `git push`, `git pull`, `git clone`, `git fetch`, `git remote`, `git lfs`, `git submodule`, …
+  Read-only git commands (`git status`, `git log`, `git diff`, `git add`, `git commit`) are **not** affected.
+- **Full-screen / TTY programs** — `vim`, `nano`, `less`, `more`, `top`, `htop`, `tmux`, `fzf`, `man`, …
+- **Commands that never exit on their own** — `tail`, `journalctl`, `yes`, `sleep`, `ping`, `nc`, `socat`, …
+
+Why: these either wait for input that will never come (the turn hangs), or require a TTY that does not exist here.
+
+What to do instead:
+
+- If a command needs authentication, tell the user to run it manually — for example "please run this in your terminal: `git push`". Do not attempt it yourself.
+- If you only need to check state, use a non-interactive alternative (`git status` instead of `git push --dry-run`, `read_files` instead of `cat`).
+- If the command genuinely needs to keep running, use `wait_until_complete=false` along with `read_shell_command_output` / `write_to_long_running_shell_command`.
+
+On top of that, any command still exceeding 30 seconds gets terminated automatically, so a stuck command can no longer block the turn forever.
+
 # Quoting and parallelism
 
 - Always quote file paths that contain spaces with double quotes:
