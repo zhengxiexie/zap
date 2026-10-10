@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use pathfinder_geometry::vector::vec2f;
+use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::color::blend::Blend;
 use warp_core::ui::theme::color::internal_colors;
 use warpui::elements::{
@@ -15,6 +16,7 @@ use warpui::r#async::{SpawnedFutureHandle, Timer};
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::ui_components::keyboard_shortcut::KeyboardShortcut;
 use warpui::{AppContext, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle};
+use warpui::notification::{NotificationSendError, UserNotification};
 
 use crate::ai::artifacts::{Artifact, ArtifactButtonsRow, ArtifactButtonsRowEvent};
 use crate::appearance::Appearance;
@@ -24,6 +26,7 @@ use crate::notifications::item_rendering::{
 };
 use crate::notifications::model::{NotificationsEvent, NotificationsModel};
 use crate::notifications::{NotificationId, NotificationItem};
+use crate::server::telemetry::TelemetryEvent;
 use crate::terminal::session_settings::SessionSettings;
 use crate::util::bindings::keybinding_name_to_keystroke;
 use crate::workspace::view::JUMP_TO_LATEST_TOAST_BINDING_NAME;
@@ -100,26 +103,40 @@ impl AgentNotificationToastStack {
     }
 
     fn on_notification_added(&mut self, id: NotificationId, ctx: &mut ViewContext<Self>) {
-        // Don't show in-app toasts when the window is not active.
-        // Native desktop notifications handle the unfocused case.
-        if ctx.windows().active_window() != Some(ctx.window_id()) {
+        log::info!("[NotificationDebug] on_notification_added called, id={:?}", id);
+        let notifications = NotificationsModel::as_ref(ctx).notifications();
+        let Some(item) = notifications.get_by_id(id) else {
+            log::warn!("[NotificationDebug] notification not found for id={:?}", id);
+            return;
+        };
+
+        log::info!("[NotificationDebug] notification item: title={}, message={}, is_read={}", item.title, item.message, item.is_read);
+
+        // Don't show a toast for notifications that are already read
+        // (e.g. the terminal was visible when the notification was created).
+        if item.is_read {
+            log::info!("[NotificationDebug] notification already read, skipping");
+            return;
+        }
+
+        let active_window = ctx.windows().active_window();
+        let current_window = ctx.window_id();
+        log::info!("[NotificationDebug] active_window={:?}, current_window={:?}", active_window, current_window);
+
+        // If the window is not active, send a native desktop notification instead of showing an in-app toast.
+        if active_window != Some(current_window) {
+            log::info!("[NotificationDebug] window not active, sending native notification");
+            // Clone the notification data before sending to avoid borrow issues
+            let title = item.title.clone();
+            let message = item.message.clone();
+            let _ = notifications;
+            self.send_native_notification(&title, &message, ctx);
             return;
         }
 
         // Don't show toasts when the notification mailbox is already open.
         // (dismiss_all is called on open, so any new arrival would be immediately visible in the mailbox.)
         if self.mailbox_is_open {
-            return;
-        }
-
-        let notifications = NotificationsModel::as_ref(ctx).notifications();
-        let Some(item) = notifications.get_by_id(id) else {
-            return;
-        };
-
-        // Don't show a toast for notifications that are already read
-        // (e.g. the terminal was visible when the notification was created).
-        if item.is_read {
             return;
         }
 
@@ -228,6 +245,44 @@ impl AgentNotificationToastStack {
             );
             entry.abort_handle = Some(abort_handle);
         }
+    }
+
+    /// Sends a native desktop notification (used when the app window is not active).
+    fn send_native_notification(&self, title: &str, message: &str, ctx: &mut ViewContext<Self>) {
+        log::info!("[NotificationDebug] send_native_notification called: title='{}', message='{}'", title, message);
+        
+        // Read the notification sound setting from SessionSettings
+        let play_sound = SessionSettings::as_ref(ctx)
+            .notifications
+            .play_notification_sound;
+
+        log::info!("[NotificationDebug] play_sound={}, calling ctx.send_desktop_notification", play_sound);
+
+        ctx.send_desktop_notification(
+            UserNotification::new_with_sound(
+                title.to_string(),
+                message.to_string(),
+                None, // No custom data for now
+                play_sound,
+            ),
+            move |_me, notification_error, ctx| {
+                // Log errors for debugging
+                log::info!("[NotificationDebug] notification callback invoked, error={:?}", notification_error);
+                if let NotificationSendError::Other { error_message } = &notification_error {
+                    log::error!(
+                        "Failed to send native notification. error_msg: {error_message}"
+                    );
+                }
+                send_telemetry_from_ctx!(
+                    TelemetryEvent::NotificationFailedToSend {
+                        error: notification_error.clone()
+                    },
+                    ctx
+                );
+            },
+        );
+        
+        log::info!("[NotificationDebug] send_desktop_notification call completed");
     }
 }
 

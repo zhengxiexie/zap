@@ -229,20 +229,28 @@ impl NotificationsModel {
             return;
         };
 
+        log::info!(
+            "[notify-diag] history event: UpdatedConversationStatus conversation_id={conversation_id:?}"
+        );
+
         if !FeatureFlag::HOANotifications.is_enabled() {
+            log::info!("[notify-diag] skip: HOANotifications flag disabled");
             return;
         }
 
         let ai_history_model = BlocklistAIHistoryModel::as_ref(ctx);
         let Some(updated_conversation) = ai_history_model.conversation(conversation_id) else {
+            log::info!("[notify-diag] skip: conversation not in memory");
             return;
         };
 
         if updated_conversation.should_exclude_from_navigation() {
+            log::info!("[notify-diag] skip: should_exclude_from_navigation");
             return;
         }
 
         let status = updated_conversation.status().clone();
+        log::info!("[notify-diag] dispatching mailbox status={status:?}");
         let latest_query = updated_conversation.latest_user_query();
         self.handle_history_event_for_mailbox(
             &status,
@@ -369,8 +377,13 @@ impl NotificationsModel {
         ctx: &mut ModelContext<Self>,
     ) {
         if !*AISettings::as_ref(ctx).show_agent_notifications {
+            log::info!("[notify-diag] add_notification skipped: show_agent_notifications=false");
             return;
         }
+
+        log::info!(
+            "[notify-diag] add_notification: title={title:?} message={message:?} origin={origin:?}"
+        );
 
         let is_visible = is_terminal_view_visible(terminal_view_id, ctx);
         let branch = resolve_git_branch_for_terminal_view(terminal_view_id, ctx);

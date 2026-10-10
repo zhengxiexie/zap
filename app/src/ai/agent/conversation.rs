@@ -1846,7 +1846,16 @@ impl AIConversation {
 
         if !has_new_actions {
             // Update conversation-level status to success if the output has no actions.
+            log::info!(
+                "[notify-diag] mark_request_completed: conversation_id={:?} no_new_actions -> Success",
+                self.id
+            );
             self.update_status(ConversationStatus::Success, terminal_view_id, ctx);
+        } else {
+            log::info!(
+                "[notify-diag] mark_request_completed: conversation_id={:?} has_new_actions -> stays InProgress (awaiting follow-up/action completion)",
+                self.id
+            );
         }
 
         Ok(())

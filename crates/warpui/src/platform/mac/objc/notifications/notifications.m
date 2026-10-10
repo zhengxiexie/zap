@@ -50,6 +50,12 @@ void sendNotificationWithErrorHandler(NSString *title, NSString *body, NSString 
     [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
       if (settings.authorizationStatus == UNAuthorizationStatusDenied) {
           error_handler(0, @"User turned permissions off in system preferences.");
+      } else if (settings.authorizationStatus == UNAuthorizationStatusNotDetermined) {
+          // 如果用户还没有授权，先请求授权
+          error_handler(2, @"Notification permission not determined. Please grant permission in app settings.");
+      } else if (settings.authorizationStatus != UNAuthorizationStatusAuthorized) {
+          // 其他未授权状态（例如 provisional 或其他）
+          error_handler(3, @"Notification permission not fully authorized.");
       } else {
           // Create the notification content.
           // `autorelease` balances the +1 retain from `alloc`; the enclosing UserNotifications

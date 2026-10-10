@@ -437,6 +437,18 @@ NSUInteger activeScreenId() {
     return self.dockMenu;
 }
 
+// This method is called when a notification is about to be presented while the app is in the foreground.
+// Without this implementation, notifications will not be shown when the app is active.
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center
+       willPresentNotification:(UNNotification *)notification
+         withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler {
+    // Show the notification even when the app is in the foreground
+    // UNNotificationPresentationOptionAlert displays the notification banner
+    // UNNotificationPresentationOptionSound plays the notification sound
+    // UNNotificationPresentationOptionBadge updates the app badge
+    completionHandler(UNNotificationPresentationOptionAlert | UNNotificationPresentationOptionSound | UNNotificationPresentationOptionBadge);
+}
+
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
     didReceiveNotificationResponse:(UNNotificationResponse *)response
              withCompletionHandler:(void (^)(void))completionHandler {
