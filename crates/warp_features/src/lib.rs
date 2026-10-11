@@ -773,6 +773,8 @@ pub const RELEASE_FLAGS: &[FeatureFlag] = &[
     // Remote server binary is not yet supported on Windows.
     #[cfg(not(windows))]
     FeatureFlag::SshRemoteServer,
+    // HOA Notifications: 升级的 CLI agent 会话跟踪和通知基础设施。
+    FeatureFlag::HOANotifications,
 ];
 
 /// Flags that we want to allow to switch at runtime (assuming RuntimeFeatureFlags is set)

@@ -2276,6 +2276,11 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
     #[cfg(all(debug_assertions, not(windows)))]
     flags.insert(FeatureFlag::ServerFileBrowser);
 
+    // HOA Notifications: debug 构建中启用通知功能,方便开发调试 CLI agent
+    // 的会话跟踪和通知基础设施。
+    #[cfg(debug_assertions)]
+    flags.insert(FeatureFlag::HOANotifications);
+
     // Issue #72: HTTP 代理设置页面。不走 channel 判断,所有 channel 含 zap-oss
     // 默认启用,作为企业 VPN / 公司代理场景的基本能力。
     flags.insert(FeatureFlag::HttpProxySettings);

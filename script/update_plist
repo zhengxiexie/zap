@@ -265,6 +265,7 @@ plutil -insert NSContactsUsageDescription -string "A program in Warp wants to us
 plutil -insert NSCalendarsUsageDescription -string "A program in Warp wants to use your calendar." "$WARP_PLIST_PATH"
 plutil -insert NSLocationUsageDescription -string "A program in Warp wants to use your location information." "$WARP_PLIST_PATH"
 plutil -insert NSPhotoLibraryUsageDescription -string "A program in Warp wants to use your photo library." "$WARP_PLIST_PATH"
+plutil -insert NSUserNotificationUsageDescription -string "Zap wants to send you notifications about task completion and important updates." "$WARP_PLIST_PATH"
 
 echo "Disabling use of Liquid Glass on macOS Tahoe"
 plutil -insert UIDesignRequiresCompatibility -bool true "$WARP_PLIST_PATH"

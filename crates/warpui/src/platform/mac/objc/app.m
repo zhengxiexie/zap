@@ -222,6 +222,31 @@ NSUInteger activeScreenId() {
             forKeyPath:@"effectiveAppearance"
                options:(NSKeyValueObservingOptionNew | NSKeyValueObservingOptionOld)
                context:NSAppThemeChangeContext];
+    
+    // Request notification permissions
+    UNUserNotificationCenter *center = [UNUserNotificationCenter currentNotificationCenter];
+    center.delegate = self;
+    
+    // First check current authorization status
+    [center getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings * _Nonnull settings) {
+        NSLog(@"[Notification] Current authorization status: %ld", (long)settings.authorizationStatus);
+        
+        if (settings.authorizationStatus == UNAuthorizationStatusNotDetermined) {
+            // Permission not yet requested, ask for it
+            [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound | UNAuthorizationOptionBadge)
+                                  completionHandler:^(BOOL granted, NSError * _Nullable error) {
+                if (granted) {
+                    NSLog(@"[Notification] Permission granted");
+                } else {
+                    NSLog(@"[Notification] Permission denied or error: %@", error);
+                }
+            }];
+        } else if (settings.authorizationStatus == UNAuthorizationStatusAuthorized) {
+            NSLog(@"[Notification] Permission already granted");
+        } else {
+            NSLog(@"[Notification] Permission denied (status: %ld). Please enable in System Settings > Notifications.", (long)settings.authorizationStatus);
+        }
+    }];
 }
 
 - (void)observeValueForKeyPath:(NSString *)keyPath

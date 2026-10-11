@@ -33,6 +33,20 @@ Zap 是一个开放、本地优先的终端,带一等公民的 AI 与 Agent 体�
 
 见 [docs/roadmap.zh-CN.md](docs/roadmap.zh-CN.md)。
 
+## 从源码构建
+
+Zap 使用统一的构建脚本：
+
+```bash
+# 开发模式（5-10 分钟，终端运行查看日志）
+./build.sh dev
+
+# 发布模式（20-30 分钟，完全优化，自动安装到 /Applications）
+./build.sh release
+```
+
+详细构建说明见 [lessons/zap-oss-build-workflow.md](lessons/zap-oss-build-workflow.md)。
+
 ## 鸣谢
 
 - [Warp](https://github.com/warpdotdev/warp) —— Zap 所基于的上游终端。

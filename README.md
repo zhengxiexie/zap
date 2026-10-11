@@ -34,6 +34,20 @@ across.
 
 See [docs/roadmap.md](docs/roadmap.md).
 
+## Building from Source
+
+Zap uses a unified build script:
+
+```bash
+# Development mode (5-10 min, runs in terminal with logs)
+./build.sh dev
+
+# Release mode (20-30 min, optimized, auto-installs to /Applications)
+./build.sh release
+```
+
+See [lessons/zap-oss-build-workflow.md](lessons/zap-oss-build-workflow.md) for detailed build instructions.
+
 ## Acknowledgements
 
 - [Warp](https://github.com/warpdotdev/warp) — the upstream terminal Zap is built on.
