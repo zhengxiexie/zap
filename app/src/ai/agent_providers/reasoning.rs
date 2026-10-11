@@ -39,6 +39,14 @@ pub fn model_reasoning_variants(
                 // Opus 4.7+: adaptive thinking + xhigh + max(genai 已适配)
                 return vec![R::High, R::Low, R::Medium, R::XHigh, R::Max, R::Off];
             }
+            if id.contains("claude-opus-5-5") {
+                // Opus 5.5: adaptive thinking 必需,支持所有档位
+                return vec![R::High, R::Low, R::Medium, R::XHigh, R::Max, R::Off];
+            }
+            if id.contains("claude-opus-5") {
+                // Opus 5.0: 标准 reasoning 支持
+                return vec![R::High, R::Low, R::Medium, R::Off];
+            }
             if id.contains("claude-opus-4-6") || id.contains("claude-sonnet-4-6") {
                 // 4.6 系: adaptive thinking + max
                 return vec![R::High, R::Low, R::Medium, R::Max, R::Off];

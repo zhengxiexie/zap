@@ -3301,16 +3301,28 @@ const BYOP_STREAM_MAX_RETRIES: usize = 3;
 ///
 /// - `WebStream` / `WebAdapterCall` / `WebModelCall`:连接被拒、DNS、TLS、
 ///   超时、流中断等传输层故障 —— 即截图里 `error sending request for url` 那类。
-/// - `HttpError`:仅 408 / 429 / 5xx 重试。4xx(401 key 错、404 模型名错、
-///   400 请求体非法)重试多少次都一样,直接报错让用户去改配置。
+/// - `HttpError`:408 / 429 / 5xx 总是重试。400 在以下情况重试:
+///   * `invalid_request` 错误(服务端参数校验/分布式状态临时不一致)
+///   其他 4xx(401 key 错、404 模型名错)不可重试。
 /// - `Resolver` / 鉴权类 / 请求构造类:不可重试。
 fn is_retryable_genai_error(err: &genai::Error) -> bool {
     use genai::Error as G;
     match err {
         G::WebStream { .. } | G::WebAdapterCall { .. } | G::WebModelCall { .. } => true,
-        G::HttpError { status, .. } => {
+        G::HttpError { status, body, .. } => {
             let code = status.as_u16();
-            code == 408 || code == 429 || (500..600).contains(&code)
+            // 408 / 429 / 5xx 总是重试
+            if code == 408 || code == 429 || (500..600).contains(&code) {
+                return true;
+            }
+            // 400 Bad Request:仅在错误类型为 "invalid_request_error" 时重试
+            // (通常是服务端参数校验或临时分布式状态不一致,重试有机会成功)
+            if code == 400 {
+                return body.contains("invalid_request")
+                    || body.contains("invalid_request_error")
+                    || body.contains("request_too_large");
+            }
+            false
         }
         G::StreamParse { .. }
         | G::SerdeJson(_)

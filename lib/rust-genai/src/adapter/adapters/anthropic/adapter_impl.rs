@@ -25,10 +25,11 @@ const REASONING_HIGH: u32 = 24000;
 
 // NOTE: For now, those are opt-ins, but should become opt-out when well supported.
 // see: effort doc: https://platform.claude.com/docs/en/build-with-claude/effort
-const SUPPORT_EFFORT_MODELS: &[&str] = &["claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-5"];
-const SUPPORT_REASONING_MAX_MODELS: &[&str] = &["claude-opus-4-6"];
+const SUPPORT_EFFORT_MODELS: &[&str] = &["claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-5", "claude-opus-5"];
+const SUPPORT_REASONING_MAX_MODELS: &[&str] = &["claude-opus-4-6", "claude-opus-5"];
 // see:adaptive thinking: https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
-const SUPPORT_ADAPTTIVE_THINK_MODELS: &[&str] = &["claude-opus-4-6", "claude-sonnet-4-6"];
+// claude-opus-5-5 强制要求 adaptive thinking
+const SUPPORT_ADAPTTIVE_THINK_MODELS: &[&str] = &["claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-5-5"];
 
 fn has_model(model_prefixes: &[&str], model_name: &str) -> bool {
 	model_prefixes.iter().any(|prefix| model_name.contains(prefix))
@@ -323,7 +324,13 @@ impl Adapter for AnthropicAdapter {
 
 					(model, reasoning)
 				} else {
-					(model, None)
+					// claude-opus-5-5 强制要求 adaptive thinking，如果没有显式指定，设置默认值
+					let reasoning = if model.contains("claude-opus-5-5") {
+						Some(ReasoningEffort::High)
+					} else {
+						None
+					};
+					(model, reasoning)
 				}
 			}
 			// If reasoning effort, turn the low, medium, budget ones into Budget
