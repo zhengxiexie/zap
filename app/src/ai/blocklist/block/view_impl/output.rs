@@ -1,6 +1,7 @@
 //! Renders the AI output portion of the AI block.
 //!
-//! This includes text, code snippets, suggested commands, and interactive inline action UX.
+//! This includes text, reasoning traces, tool action cards, suggested commands, and
+//! interactive inline action UX.
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::comment::ReviewComment;
 use crate::ai::agent::task::TaskId;
@@ -107,8 +108,9 @@ use itertools::Itertools;
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
 use warp_core::channel::ChannelState;
 
+use super::action_groups::{compute_action_groups, group_starting_at, ActionGroup};
 use super::common::{
-    format_elapsed_seconds, render_debug_footer, render_failed_output, render_informational_footer,
+    render_debug_footer, render_failed_output, render_informational_footer,
     render_output_status_text, render_scrollable_collapsible_content, render_text_sections,
     DebugFooterProps, FailedOutputProps, FindContext, TextSectionsProps,
     STATUS_FOOTER_VERTICAL_PADDING, STATUS_ICON_SIZE_DELTA,
@@ -276,7 +278,48 @@ pub(super) fn render(props: Props, app: &AppContext) -> Box<dyn Element> {
                     AIBlockAction::CopyAIBlockCodeSnippet(snippet)
                 }
 
-                for output_message in output.messages.iter() {
+                let action_groups = compute_action_groups(&output.messages);
+                let is_group_collapsed = |group: &ActionGroup| {
+                    props
+                        .collapsible_block_states
+                        .get(&group.id)
+                        .is_some_and(|state| {
+                            matches!(state.expansion_state, CollapsibleExpansionState::Collapsed)
+                        })
+                };
+                let collapsed_group_members: std::collections::HashSet<usize> = action_groups
+                    .iter()
+                    .filter(|group| is_group_collapsed(group))
+                    .flat_map(|group| group.members_after_first())
+                    .collect();
+
+                for (message_index, output_message) in output.messages.iter().enumerate() {
+                    if collapsed_group_members.contains(&message_index) {
+                        continue;
+                    }
+
+                    if let Some(group) = group_starting_at(&action_groups, message_index) {
+                        output_items.add_child(render_action_group_card(group, props, app));
+
+                        if is_group_collapsed(group) {
+                            for member_index in &group.member_indices {
+                                if let AIAgentOutputMessageType::Action(action) =
+                                    &output.messages[*member_index].message
+                                {
+                                    action_index += 1;
+                                    if matches!(
+                                        action.action,
+                                        AIAgentActionType::RequestCommandOutput { .. }
+                                            | AIAgentActionType::CallMCPTool { .. }
+                                    ) {
+                                        should_render_references_section = false;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
                     match &output_message.message {
                         // Skip rendering text and reasoning sections if this is a passive conversation.
                         AIAgentOutputMessageType::Text(_)
@@ -346,11 +389,13 @@ pub(super) fn render(props: Props, app: &AppContext) -> Box<dyn Element> {
                         } if !are_all_text_sections_empty(sections)
                             && props.thinking_display_mode.should_render() =>
                         {
-                            let header_text = if let Some(dur) = finished_duration {
-                                format!("Thought for {}", format_elapsed_seconds(*dur))
-                            } else {
-                                "Thinking".to_string()
-                            };
+                            let header_text = props
+                                .collapsible_block_states
+                                .get(&output_message.id)
+                                .map(|state| {
+                                    reasoning_header_text(state, *finished_duration, sections)
+                                })
+                                .unwrap_or_else(|| "Thinking".to_string());
                             if let Some(element) = render_collapsible_block(
                                 output_message,
                                 header_text,
@@ -2804,6 +2849,123 @@ pub(super) fn blocked_action_header<V: View>(
         })
 }
 
+/// 折叠摘要行最多显示的字符数。
+const REASONING_PREVIEW_MAX_CHARS: usize = 48;
+
+/// 紧凑耗时格式:12s / 1m 05s。思考标题需要塞进一行,所以不用长句式。
+fn format_compact_elapsed(elapsed: std::time::Duration) -> String {
+    let total_seconds = elapsed.as_secs();
+    if total_seconds >= 60 {
+        format!("{}m {}s", total_seconds / 60, total_seconds % 60)
+    } else {
+        format!("{total_seconds}s")
+    }
+}
+
+/// 取思考内容的第一句非空文本,作为折叠后的摘要。
+fn reasoning_preview(sections: &[AIAgentTextSection]) -> Option<String> {
+    let text = sections.iter().find_map(|section| match section {
+        AIAgentTextSection::PlainText { text } => Some(text.text()),
+        _ => None,
+    })?;
+    let first_line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+
+    let mut preview = String::new();
+    for (index, ch) in first_line.chars().enumerate() {
+        if index >= REASONING_PREVIEW_MAX_CHARS {
+            preview.push('…');
+            break;
+        }
+        preview.push(ch);
+    }
+    (!preview.is_empty()).then_some(preview)
+}
+
+/// 思考折叠块的单行标题。
+///
+/// - 进行中:`Thinking… 3s`(本地计时,BYOP provider 不下发 duration)
+/// - 已完成:`Thought for 12s`(服务端下发优先,否则用本地计时)
+/// - 折叠态额外拼上首句摘要,避免折叠后信息全丢
+fn reasoning_header_text(
+    state: &CollapsibleElementState,
+    server_duration: Option<std::time::Duration>,
+    sections: &[AIAgentTextSection],
+) -> String {
+    let duration = server_duration.or_else(|| state.finished_duration());
+    let label = if let Some(duration) = duration {
+        format!("Thought for {}", format_compact_elapsed(duration))
+    } else if state.is_finished() {
+        "Thought".to_string()
+    } else if let Some(elapsed) = state.streaming_elapsed() {
+        format!("Thinking… {}", format_compact_elapsed(elapsed))
+    } else {
+        "Thinking".to_string()
+    };
+
+    let is_collapsed = matches!(state.expansion_state, CollapsibleExpansionState::Collapsed);
+    match (is_collapsed, reasoning_preview(sections)) {
+        (true, Some(preview)) => format!("{label} · {preview}"),
+        _ => label,
+    }
+}
+
+/// Renders the collapsed/expanded card that summarizes a run of tool calls.
+fn render_action_group_card(
+    group: &ActionGroup,
+    props: Props,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    let text_color = blended_colors::text_disabled(theme, theme.surface_2());
+    let icon_size = icon_size(app);
+
+    let state = props.collapsible_block_states.get(&group.id);
+    let is_finished = state.is_some_and(|state| state.is_finished());
+    let duration = state.and_then(|state| {
+        state
+            .finished_duration()
+            .or_else(|| state.streaming_elapsed())
+    });
+
+    let title = group.title(is_finished);
+    let header_text = match duration {
+        Some(duration) if is_finished => {
+            format!("{title} · worked for {}", format_compact_elapsed(duration))
+        }
+        Some(duration) => format!("{title} · working for {}", format_compact_elapsed(duration)),
+        None => title,
+    };
+
+    let header: Box<dyn Element> = match state {
+        Some(state) => render_collapsible_header(&group.id, state, header_text, text_color, app),
+        None => Empty::new().finish(),
+    };
+
+    let summary = Container::new(
+        Text::new(
+            group.summary_text(),
+            appearance.ai_font_family(),
+            appearance.monospace_font_size(),
+        )
+        .with_color(text_color)
+        .with_selectable(false)
+        .finish(),
+    )
+    .with_horizontal_margin(CONTENT_HORIZONTAL_PADDING + icon_size + 16.)
+    .finish();
+
+    Container::new(
+        Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(header)
+            .with_child(summary)
+            .finish(),
+    )
+    .with_margin_bottom(8.)
+    .finish()
+}
+
 fn render_collapsible_header(
     message_id: &MessageId,
     element_state: &CollapsibleElementState,
@@ -2860,6 +3022,195 @@ fn render_collapsible_header(
 
     Container::new(Flex::row().with_child(expandable.finish()).finish())
         .with_horizontal_margin(CONTENT_HORIZONTAL_PADDING + icon_size + 16.)
+        .finish()
+}
+
+/// Renders the header card for a collapsed run of agent steps. The card lives
+/// on the first block of the run and expands it to show every step again.
+pub(crate) fn render_agent_run_card(
+    run: &crate::ai::blocklist::block_runs::AgentRunInfo,
+    is_expanded: bool,
+    mouse_state: &warpui::elements::MouseStateHandle,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    let icon_size = icon_size(app);
+    let chevron_icon = if is_expanded {
+        Icon::ChevronDown
+    } else {
+        Icon::ChevronRight
+    };
+    let step_label = if run.step_count == 1 { "step" } else { "steps" };
+    let steps_text = format!("{} {step_label}", run.step_count);
+    let detail_text = run.totals.summary_text();
+    let font_family = appearance.ai_font_family();
+    let font_size = appearance.monospace_font_size();
+
+    let toggler = Hoverable::new(
+        mouse_state.clone(),
+        move |mouse_state: &warpui::elements::MouseState| {
+            let is_hovered = mouse_state.is_hovered();
+            let background = if is_hovered {
+                theme.surface_3()
+            } else {
+                theme.surface_2()
+            };
+            let main_color = blended_colors::text_main(theme, background);
+            let muted_color = blended_colors::text_disabled(theme, background);
+
+            let mut row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(6.)
+                .with_child(
+                    ConstrainedBox::new(
+                        chevron_icon
+                            .to_warpui_icon(muted_color.into())
+                            .finish(),
+                    )
+                    .with_width(icon_size - 4.)
+                    .with_height(icon_size - 4.)
+                    .finish(),
+                )
+                .with_child(
+                    Text::new(steps_text.clone(), font_family.clone(), font_size)
+                        .with_color(main_color)
+                        .with_selectable(false)
+                        .finish(),
+                );
+            if !detail_text.is_empty() {
+                row = row
+                    .with_child(
+                        Text::new("·".to_owned(), font_family.clone(), font_size)
+                            .with_color(muted_color)
+                            .with_selectable(false)
+                            .finish(),
+                    )
+                    .with_child(
+                        Text::new(detail_text.clone(), font_family.clone(), font_size)
+                            .with_color(muted_color)
+                            .with_selectable(false)
+                            .finish(),
+                    );
+            }
+
+            Container::new(row.finish())
+                .with_background(background)
+                .with_border(Border::all(1.).with_border_fill(theme.outline()))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                .with_horizontal_padding(10.)
+                .with_vertical_padding(5.)
+                .finish()
+        },
+    )
+    .with_cursor(Cursor::PointingHand)
+    .on_click(move |ctx, _, _| {
+        ctx.dispatch_typed_action(AIBlockAction::ToggleAgentRunExpanded);
+    });
+
+    Container::new(Align::new(toggler.finish()).left().finish())
+        .with_horizontal_margin(CONTENT_HORIZONTAL_PADDING + icon_size + 16.)
+        .with_margin_bottom(8.)
+        .finish()
+}
+
+/// Renders one step of an expanded run as a single collapsed row. Clicking the
+/// row reveals that step's full output, so a long run stays scannable.
+pub(crate) fn render_agent_step_row(
+    run: &crate::ai::blocklist::block_runs::AgentRunInfo,
+    is_expanded: bool,
+    headline: Option<String>,
+    mouse_state: &warpui::elements::MouseStateHandle,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    let icon_size = icon_size(app);
+    let chevron_icon = if is_expanded {
+        Icon::ChevronDown
+    } else {
+        Icon::ChevronRight
+    };
+    let step_text = format!("Step {}", run.position);
+    let detail_text = run.step_counts.summary_text();
+    let font_family = appearance.ai_font_family();
+    let font_size = appearance.monospace_font_size();
+
+    let toggler = Hoverable::new(
+        mouse_state.clone(),
+        move |mouse_state: &warpui::elements::MouseState| {
+            let is_hovered = mouse_state.is_hovered();
+            let background = if is_hovered {
+                theme.surface_2()
+            } else {
+                warp_core::ui::theme::Fill::Solid(ColorU::transparent_black())
+            };
+            let main_color = blended_colors::text_sub(theme, theme.surface_2());
+            let muted_color = blended_colors::text_disabled(theme, theme.surface_2());
+
+            let mut row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(6.)
+                .with_child(
+                    ConstrainedBox::new(chevron_icon.to_warpui_icon(muted_color.into()).finish())
+                        .with_width(icon_size - 4.)
+                        .with_height(icon_size - 4.)
+                        .finish(),
+                )
+                .with_child(
+                    Text::new(step_text.clone(), font_family.clone(), font_size)
+                        .with_color(main_color)
+                        .with_selectable(false)
+                        .finish(),
+                );
+            if !detail_text.is_empty() {
+                row = row
+                    .with_child(
+                        Text::new("·".to_owned(), font_family.clone(), font_size)
+                            .with_color(muted_color)
+                            .with_selectable(false)
+                            .finish(),
+                    )
+                    .with_child(
+                        Text::new(detail_text.clone(), font_family.clone(), font_size)
+                            .with_color(muted_color)
+                            .with_selectable(false)
+                            .finish(),
+                    );
+            }
+
+            if let Some(headline) = headline.clone() {
+                row = row
+                    .with_child(
+                        Text::new("·".to_owned(), font_family.clone(), font_size)
+                            .with_color(muted_color)
+                            .with_selectable(false)
+                            .finish(),
+                    )
+                    .with_child(
+                        Text::new(headline, font_family.clone(), font_size)
+                            .with_color(muted_color)
+                            .with_selectable(false)
+                            .finish(),
+                    );
+            }
+
+            Container::new(row.finish())
+                .with_background(background)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+                .with_horizontal_padding(8.)
+                .with_vertical_padding(3.)
+                .finish()
+        },
+    )
+    .with_cursor(Cursor::PointingHand)
+    .on_click(move |ctx, _, _| {
+        ctx.dispatch_typed_action(AIBlockAction::ToggleAgentStepExpanded);
+    });
+
+    Container::new(Align::new(toggler.finish()).left().finish())
+        .with_horizontal_margin(CONTENT_HORIZONTAL_PADDING + icon_size + 28.)
+        .with_margin_bottom(2.)
         .finish()
 }
 
@@ -2922,6 +3273,15 @@ fn render_collapsible_text_block_section(
 
     // Render the collapsible header when the block should remain manually toggleable.
     if show_header {
+        // 折叠后不再渲染正文，标题行的下间距同步收紧，让多条思考步骤在读感上接近一条时间线。
+        let header_margin_bottom = if matches!(
+            element_state.expansion_state,
+            CollapsibleExpansionState::Collapsed
+        ) {
+            8.
+        } else {
+            16.
+        };
         container.add_child(
             Container::new(render_collapsible_header(
                 message_id,
@@ -2930,7 +3290,7 @@ fn render_collapsible_text_block_section(
                 text_color,
                 app,
             ))
-            .with_margin_bottom(16.)
+            .with_margin_bottom(header_margin_bottom)
             .finish(),
         );
         *has_rendered_first_text_section = true;
@@ -2982,7 +3342,7 @@ fn render_collapsible_text_block_section(
     let max_height = if props.thinking_display_mode.should_keep_expanded() || !is_streaming {
         360.
     } else {
-        120.
+        72.
     };
     let body = Container::new(rendered_sections)
         .with_margin_bottom(-16.0)

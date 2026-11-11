@@ -3152,6 +3152,51 @@ fn point_from_first_visible_row(
     IndexPoint::new(visible_row, within_block.inner.col)
 }
 
+/// AI blocks that belong to a collapsed run and must not be laid out.
+///
+/// The head of a run stays visible and carries the summary card; every other
+/// member is collapsed away until the user expands the run.
+fn collapsed_rich_content_views(
+    rich_content_metadata: &HashMap<EntityId, RichContentMetadata>,
+    app: &AppContext,
+) -> HashSet<EntityId> {
+    let mut exchange_to_view = HashMap::new();
+    for (view_id, metadata) in rich_content_metadata.iter() {
+        if let RichContentMetadata::AIBlock(metadata) = metadata {
+            exchange_to_view.insert(metadata.exchange_id, *view_id);
+        }
+    }
+
+    let mut collapsed = HashSet::new();
+    for (view_id, metadata) in rich_content_metadata.iter() {
+        let RichContentMetadata::AIBlock(metadata) = metadata else {
+            continue;
+        };
+        let Some(run) = metadata.ai_block_handle.as_ref(app).agent_run(app) else {
+            continue;
+        };
+        if run.is_head {
+            continue;
+        }
+        let Some(head_view_id) = exchange_to_view.get(&run.head_exchange_id) else {
+            continue;
+        };
+        let Some(RichContentMetadata::AIBlock(head_metadata)) =
+            rich_content_metadata.get(head_view_id)
+        else {
+            continue;
+        };
+        if !head_metadata
+            .ai_block_handle
+            .as_ref(app)
+            .is_agent_run_expanded()
+        {
+            collapsed.insert(*view_id);
+        }
+    }
+    collapsed
+}
+
 impl Element for BlockListElement {
     fn layout(
         &mut self,
@@ -3210,6 +3255,7 @@ impl Element for BlockListElement {
         let mut block_indices_with_label_elements = vec![];
         let mut visible_block_indices = vec![];
         let mut updated_rich_content_heights = HashMap::new();
+        let collapsed_rich_content = collapsed_rich_content_views(&self.rich_content_metadata, app);
 
         // First, remeasure any rich content items whose heights may be out of date.
         // We track these in the BlockList via a dirty set keyed by view ID to
@@ -3217,6 +3263,10 @@ impl Element for BlockListElement {
         let dirty_rich_content_items = model.block_list_mut().take_dirty_rich_content_items();
         if !dirty_rich_content_items.is_empty() {
             for view_id in &dirty_rich_content_items {
+                if collapsed_rich_content.contains(view_id) {
+                    updated_rich_content_heights.insert(*view_id, 0.0);
+                    continue;
+                }
                 if let Some(rich_content) = self.rich_content_elements.get_mut(view_id) {
                     // Lay out the rich content with an infinite vertical constraint,
                     // allowing it to take up as much size as it needs.
@@ -3301,6 +3351,12 @@ impl Element for BlockListElement {
                 // Skip any items which were already updated because they were explicitly
                 // dirtied.
                 if updated_rich_content_heights.contains_key(&view_id) {
+                    continue;
+                }
+
+                // Collapsed run members take no space at all.
+                if collapsed_rich_content.contains(&view_id) {
+                    updated_rich_content_heights.insert(view_id, 0.0);
                     continue;
                 }
 
@@ -3523,6 +3579,11 @@ impl Element for BlockListElement {
                     last_laid_out_height: height,
                     ..
                 }) => {
+                    // Collapsed run members were not laid out, so painting them
+                    // would panic on a missing saved position.
+                    if collapsed_rich_content.contains(&view_id) {
+                        continue;
+                    }
                     // Use updated height if present. Otherwise, lay out the RichContent block and
                     // use its existing blocklist height.
                     //

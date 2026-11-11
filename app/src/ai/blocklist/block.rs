@@ -30,6 +30,7 @@ use crate::ai::blocklist::context_model::AttachmentType;
 use crate::ai::blocklist::inline_action::code_diff_view::convert_file_edits_to_file_diffs;
 use crate::ai::blocklist::inline_action::suggested_unit_tests::SuggestedUnitTestsEvent;
 use crate::ai::blocklist::inline_action::suggested_unit_tests::SuggestedUnitTestsView;
+use crate::ai::blocklist::block_runs::AgentRunInfo;
 use crate::ai::blocklist::BlocklistAIContextEvent;
 use crate::ai::blocklist::BlocklistAIContextModel;
 use crate::ai::blocklist::SuggestionDismissButtonTheme;
@@ -301,7 +302,8 @@ struct ActionButtons {
     cancel_button: CompactibleActionButton,
 }
 
-/// Like `SecondaryTheme` but with grey text instead of white.
+/// Theme for the rewind button: identical to `SecondaryTheme`, except the label is
+/// grey instead of white so it reads as a secondary, non-primary action.
 struct RewindButtonTheme;
 
 impl ActionButtonTheme for RewindButtonTheme {
@@ -633,6 +635,11 @@ pub struct CollapsibleElementState {
     pub scroll_state: ClippedScrollStateHandle,
     last_known_is_finished: bool,
     user_toggled_while_streaming: bool,
+    /// 首次观察到流式内容的时间。BYOP provider 不下发 `finished_duration`,
+    /// 用它在本地兜底计算思考耗时。
+    started_at: Option<std::time::Instant>,
+    /// 思考结束时的耗时。服务端下发则优先使用服务端值。
+    finished_duration: Option<std::time::Duration>,
 }
 
 impl Default for CollapsibleElementState {
@@ -646,6 +653,8 @@ impl Default for CollapsibleElementState {
             scroll_state: ClippedScrollStateHandle::new(),
             last_known_is_finished: false,
             user_toggled_while_streaming: false,
+            started_at: None,
+            finished_duration: None,
         }
     }
 }
@@ -658,8 +667,30 @@ impl CollapsibleElementState {
         };
     }
 
+    /// 服务端下发的思考耗时(原生后端路径)。BYOP 路径拿不到,会在
+    /// [`Self::finish_reasoning`] 里用本地计时兜底。
+    pub fn set_finished_duration(&mut self, duration: std::time::Duration) {
+        self.finished_duration = Some(duration);
+    }
+
+    pub fn finished_duration(&self) -> Option<std::time::Duration> {
+        self.finished_duration
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.last_known_is_finished
+    }
+
+    /// 流式期间已经过去的时长,用于在折叠标题上显示实时计时。
+    pub fn streaming_elapsed(&self) -> Option<std::time::Duration> {
+        self.started_at.map(|started_at| started_at.elapsed())
+    }
+
     /// Mirrors the latest streamed finished state into the cached state and any expanded UI.
     fn sync_finished_state(&mut self, is_finished: bool) {
+        if !is_finished && self.started_at.is_none() {
+            self.started_at = Some(std::time::Instant::now());
+        }
         self.last_known_is_finished = is_finished;
 
         if let CollapsibleExpansionState::Expanded {
@@ -675,6 +706,10 @@ impl CollapsibleElementState {
         let should_auto_collapse = self.should_auto_collapse_reasoning_on_finish();
         let thinking_mode = AISettings::as_ref(app).thinking_display_mode;
 
+        if self.finished_duration.is_none() {
+            self.finished_duration = self.started_at.map(|started_at| started_at.elapsed());
+        }
+
         self.sync_finished_state(true);
 
         if !thinking_mode.should_keep_expanded() && should_auto_collapse {
@@ -685,6 +720,17 @@ impl CollapsibleElementState {
         } = &mut self.expansion_state
         {
             *scroll_pinned_to_bottom = false;
+        }
+    }
+
+    /// 工具聚合组：首次观测时开始计时，整组完成后记录耗时。
+    pub fn observe_group_state(&mut self, is_finished: bool) {
+        if self.started_at.is_none() {
+            self.started_at = Some(std::time::Instant::now());
+        }
+        self.sync_finished_state(is_finished);
+        if is_finished && self.finished_duration.is_none() {
+            self.finished_duration = self.started_at.map(|started_at| started_at.elapsed());
         }
     }
 
@@ -851,6 +897,20 @@ pub struct AIBlock {
     /// Requested commands that were auto-expanded,
     /// and should thus be auto-collapsed when the block is finished.
     requested_commands_to_auto_collapse: HashSet<AIAgentActionId>,
+
+    /// Hover state for the collapsed-run summary card.
+    agent_run_mouse_state: warpui::elements::MouseStateHandle,
+
+    /// Whether this block expanded the collapsed run it heads.
+    agent_run_expanded: bool,
+
+    /// Hover state for the per-step row.
+    agent_step_mouse_state: warpui::elements::MouseStateHandle,
+
+    /// Cached cross-block run for this step. Keyed on the conversation's
+    /// exchange count, so appending a step invalidates it; streaming blocks
+    /// bypass the cache entirely.
+    agent_run_cache: std::cell::Cell<Option<(usize, AgentRunInfo)>>,
 
     review_changes_button: ViewHandle<ActionButton>,
     open_all_comments_button: ViewHandle<ActionButton>,
@@ -1019,7 +1079,7 @@ impl AIBlock {
         });
 
         // Zap:原这里订阅 GetRelevantFilesController 的 Success 事件以在 RAG
-        // 完成后走个 `ctx.notify` 刷新 UI。该 controller 已随 outline 推退下线,
+        // 完成后走个 `ctx.notify` 刷新 UI。该 controller 已随 outline 一起下线,
         // 订阅点一并删除。
 
         let manage_rules_button = ctx.add_typed_action_view(|_| {
@@ -1250,6 +1310,10 @@ impl AIBlock {
             web_fetch_views: Default::default(),
             requested_commands_to_auto_collapse: Default::default(),
             review_changes_button,
+            agent_run_expanded: false,
+            agent_run_mouse_state: Default::default(),
+            agent_step_mouse_state: Default::default(),
+            agent_run_cache: Default::default(),
             open_all_comments_button,
             dismiss_suggestion_button,
             disable_rule_suggestions_button,
@@ -1867,7 +1931,9 @@ impl AIBlock {
         }
 
         // Register element state for reasoning messages and track summarization timing.
-        for message in &output.messages {
+        let is_response_streaming = self.model.status(ctx).is_streaming();
+        let message_count = output.messages.len();
+        for (index, message) in output.messages.iter().enumerate() {
             if let AIAgentOutputMessageType::Reasoning {
                 finished_duration, ..
             } = &message.message
@@ -1876,7 +1942,18 @@ impl AIBlock {
                     .collapsible_block_states
                     .entry(message.id.clone())
                     .or_default();
-                if finished_duration.is_some() {
+                if let Some(duration) = finished_duration {
+                    entry.set_finished_duration(*duration);
+                }
+                // 思考块在「模型已经往下走了」时就算结束：
+                // 1. 服务端下发了 finished_duration（原生后端路径）；
+                // 2. 后面已经有别的消息（进入了下一个步骤）；
+                // 3. 整个响应不再流式。
+                // BYOP provider 从不下发 finished_duration，只靠 2/3 兜底。
+                let reasoning_turn_complete = finished_duration.is_some()
+                    || index + 1 < message_count
+                    || !is_response_streaming;
+                if reasoning_turn_complete {
                     entry.finish_reasoning(ctx);
                 } else {
                     entry.sync_finished_state(false);
@@ -1925,6 +2002,49 @@ impl AIBlock {
                     .entry(message.id.clone())
                     .or_default();
             }
+        }
+
+        // 工具调用聚合组：一组内所有 action 共用同一个合成 MessageId 的折叠状态。
+        // text / reasoning 在组内都是透明的：模型会在工具之间输出思考和说明，
+        // 如果它们也算边界，真实对话里每组永远只有 1 个 action。
+        for group in view_impl::action_groups::compute_action_groups(&output.messages) {
+            let all_actions_done = group.member_indices.iter().all(|member_index| {
+                match &output.messages[*member_index].message {
+                    AIAgentOutputMessageType::Action(action) => match action.action {
+                        // 读类工具瞬时完成，不会在 action model 里留下状态。
+                        AIAgentActionType::ReadFiles(..)
+                        | AIAgentActionType::Grep { .. }
+                        | AIAgentActionType::FileGlob { .. }
+                        | AIAgentActionType::FileGlobV2 { .. }
+                        | AIAgentActionType::ReadMCPResource { .. }
+                        | AIAgentActionType::ReadSkill(..) => true,
+                        _ => self
+                            .action_model
+                            .as_ref(ctx)
+                            .get_action_status(&action.id)
+                            .is_some_and(|status| status.is_done()),
+                    },
+                    _ => true,
+                }
+            });
+            let last_member = group.member_indices.last().copied().unwrap_or_default();
+            let has_later_message = output.messages.get(last_member + 1..).is_some_and(|rest| {
+                rest.iter().any(|message| {
+                    !matches!(
+                        message.message,
+                        AIAgentOutputMessageType::Reasoning { .. }
+                    )
+                })
+            });
+            let group_finished = all_actions_done && (has_later_message || !is_response_streaming);
+
+            self.collapsible_block_states
+                .entry(group.id.clone())
+                .or_insert_with(|| CollapsibleElementState {
+                    expansion_state: CollapsibleExpansionState::Collapsed,
+                    ..Default::default()
+                })
+                .observe_group_state(group_finished);
         }
 
         if get_secret_obfuscation_mode(ctx).should_redact_secret() {
@@ -3727,6 +3847,74 @@ impl AIBlock {
         self.model.status(app).is_complete()
     }
 
+    /// The run of consecutive tool-only agent steps this block belongs to.
+    ///
+    /// Returns `None` when the step cannot be collapsed: it is passive, it ends
+    /// with answer text, or it has no adjacent siblings to group with.
+    pub fn agent_run(
+        &self,
+        app: &AppContext,
+    ) -> Option<crate::ai::blocklist::block_runs::AgentRunInfo> {
+        use crate::ai::blocklist::block_runs::{
+            agent_run_containing, summarize_exchange, AgentStepSummary, BlockStep,
+        };
+
+        if self.is_passive_conversation(app) {
+            return None;
+        }
+
+        let history_model =
+            crate::ai::blocklist::history_model::BlocklistAIHistoryModel::as_ref(app);
+        let conversation = history_model.conversation(&self.client_ids.conversation_id)?;
+        let exchange_count = conversation.exchange_count();
+        let is_streaming = self.model.status(app).is_streaming();
+
+        if !is_streaming {
+            if let Some((cached_count, cached)) = self.agent_run_cache.get() {
+                if cached_count == exchange_count {
+                    return Some(cached);
+                }
+            }
+        }
+
+        let exchanges: Vec<_> = conversation.root_task_exchanges().collect();
+        let summaries: Vec<AgentStepSummary> = exchanges
+            .iter()
+            .map(|exchange| summarize_exchange(exchange))
+            .collect();
+        let steps: Vec<BlockStep> = summaries
+            .iter()
+            .map(|summary| summary.to_step(false))
+            .collect();
+        let index = exchanges
+            .iter()
+            .position(|exchange| exchange.id == self.client_ids.client_exchange_id)?;
+        let exchange_ids: Vec<_> = exchanges.iter().map(|exchange| exchange.id).collect();
+        let info = agent_run_containing(&steps, &summaries, &exchange_ids, index)?;
+
+        if !is_streaming {
+            self.agent_run_cache.set(Some((exchange_count, info)));
+        }
+        Some(info)
+    }
+
+    /// Whether the collapsed run headed by this block is expanded.
+    pub fn is_agent_run_expanded(&self) -> bool {
+        self.agent_run_expanded
+    }
+
+    pub fn toggle_agent_run_expanded(&mut self, ctx: &mut ViewContext<Self>) {
+        self.agent_run_expanded = !self.agent_run_expanded;
+        ctx.notify();
+    }
+
+    /// Whether this step's full content is shown inside an expanded run.
+    pub fn agent_step_is_expanded(&self, app: &AppContext) -> bool {
+        crate::ai::blocklist::history_model::BlocklistAIHistoryModel::as_ref(app)
+            .expanded_agent_step(&self.client_ids.conversation_id)
+            == Some(self.client_ids.client_exchange_id)
+    }
+
     /// Returns `true` if the block contains any actions that are blocked on user confirmation.
     pub fn is_blocked_on_user_confirmation(&self, app: &AppContext) -> bool {
         self.requested_action_ids
@@ -5318,6 +5506,10 @@ pub enum AIBlockAction {
     },
     ToggleTodoListExpanded(MessageId),
     ToggleCollapsibleBlockExpanded(MessageId),
+    /// Expand or collapse the run of agent steps headed by this block.
+    ToggleAgentRunExpanded,
+    /// Expand or collapse this step's full content inside a run.
+    ToggleAgentStepExpanded,
     SetCollapsibleBlockPinnedToBottom {
         message_id: MessageId,
         pinned_to_bottom: bool,
@@ -5797,6 +5989,37 @@ impl TypedActionView for AIBlock {
                     state.toggle_expansion();
                 }
             }
+            AIBlockAction::ToggleAgentRunExpanded => {
+                self.agent_run_expanded = !self.agent_run_expanded;
+                self.agent_run_cache.set(None);
+                if !self.agent_run_expanded {
+                    // Collapsing a run collapses every step inside it.
+                    let conversation_id = self.client_ids.conversation_id;
+                    crate::ai::blocklist::history_model::BlocklistAIHistoryModel::handle(ctx)
+                        .update(ctx, |model, _| {
+                            model.set_expanded_agent_step(conversation_id, None);
+                        });
+                }
+            }
+            AIBlockAction::ToggleAgentStepExpanded => {
+                let conversation_id = self.client_ids.conversation_id;
+                let exchange_id = self.client_ids.client_exchange_id;
+                let currently_expanded = crate::ai::blocklist::history_model::BlocklistAIHistoryModel::as_ref(
+                    ctx,
+                )
+                .expanded_agent_step(&conversation_id);
+                let next = if currently_expanded == Some(exchange_id) {
+                    None
+                } else {
+                    Some(exchange_id)
+                };
+                crate::ai::blocklist::history_model::BlocklistAIHistoryModel::handle(ctx).update(
+                    ctx,
+                    |model, _| {
+                        model.set_expanded_agent_step(conversation_id, next);
+                    },
+                );
+            }
             AIBlockAction::ToggleCodeReviewPane => {
                 ctx.emit(AIBlockEvent::ToggleCodeReviewPane {
                     entrypoint: CodeReviewPaneEntrypoint::AgentModeRunning,
@@ -5867,7 +6090,7 @@ impl TypedActionView for AIBlock {
                 ctx.open_url(url);
             }
             AIBlockAction::ViewScreenshot { action_id: _ } => {
-                // Computer Use 已被移除,screenshot lightbox 不再可用。
+                // Computer Use has been removed, so the screenshot lightbox is no longer available.
             }
         }
         ctx.notify();

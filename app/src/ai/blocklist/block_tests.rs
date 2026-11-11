@@ -20,6 +20,43 @@ fn reasoning_auto_collapses_when_user_has_not_manually_toggled() {
     });
 }
 
+/// BYOP provider 不下发 `finished_duration`，折叠时仍需用本地计时给出“思考了多久”。
+#[test]
+fn finish_reasoning_falls_back_to_local_duration() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        let mut state = CollapsibleElementState::default();
+
+        state.sync_finished_state(false);
+        assert!(state.streaming_elapsed().is_some());
+
+        app.update(|ctx| {
+            state.finish_reasoning(ctx);
+        });
+
+        assert!(state.finished_duration().is_some());
+    });
+}
+
+#[test]
+fn server_duration_takes_precedence_over_local_timer() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        let mut state = CollapsibleElementState::default();
+
+        state.sync_finished_state(false);
+        state.set_finished_duration(std::time::Duration::from_secs(42));
+        app.update(|ctx| {
+            state.finish_reasoning(ctx);
+        });
+
+        assert_eq!(
+            state.finished_duration(),
+            Some(std::time::Duration::from_secs(42))
+        );
+    });
+}
+
 #[test]
 fn always_show_thinking_stays_expanded_after_finish() {
     App::test((), |mut app| async move {

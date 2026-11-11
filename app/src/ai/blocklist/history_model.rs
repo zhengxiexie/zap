@@ -200,6 +200,11 @@ pub struct BlocklistAIHistoryModel {
     /// via `set_parent_for_conversation` and `restore_conversations`.
     children_by_parent: HashMap<AIConversationId, Vec<AIConversationId>>,
 
+    /// The exchange whose step row is expanded inside a collapsed-run UI, per
+    /// conversation. Collapsing a run clears the entry so children collapse
+    /// together with their parent.
+    expanded_agent_step: HashMap<AIConversationId, AIAgentExchangeId>,
+
     #[cfg(feature = "local_fs")]
     db_connection: Option<Arc<Mutex<SqliteConnection>>>,
 }
@@ -232,6 +237,30 @@ impl BlocklistAIHistoryModel {
     #[cfg(test)]
     pub(crate) fn new_for_test() -> Self {
         Self::default()
+    }
+
+    /// The step whose row is expanded inside an expanded agent run.
+    pub fn expanded_agent_step(
+        &self,
+        conversation_id: &AIConversationId,
+    ) -> Option<AIAgentExchangeId> {
+        self.expanded_agent_step.get(conversation_id).copied()
+    }
+
+    /// Sets (or clears, with `None`) the expanded step for a conversation.
+    pub fn set_expanded_agent_step(
+        &mut self,
+        conversation_id: AIConversationId,
+        exchange_id: Option<AIAgentExchangeId>,
+    ) {
+        match exchange_id {
+            Some(exchange_id) => {
+                self.expanded_agent_step.insert(conversation_id, exchange_id);
+            }
+            None => {
+                self.expanded_agent_step.remove(&conversation_id);
+            }
+        }
     }
 
     /// Returns a flattened and ordered (oldest first) list of live conversations (not cleared) for the given terminal view ID.

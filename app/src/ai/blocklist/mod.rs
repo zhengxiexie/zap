@@ -2,6 +2,7 @@
 mod action_model;
 pub mod agent_view;
 pub mod block;
+pub(crate) mod block_runs;
 pub mod code_block;
 mod context_model;
 mod controller;

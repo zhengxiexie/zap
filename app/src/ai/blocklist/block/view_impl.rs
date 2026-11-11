@@ -18,6 +18,7 @@
 //! —————————————————————————————————
 //! ```
 
+pub(crate) mod action_groups;
 pub(super) mod common;
 pub use common::FindContext;
 mod comments;
@@ -1018,7 +1019,38 @@ impl View for AIBlock {
         let is_conversation_transcript_viewer = terminal_model.is_conversation_transcript_viewer();
         drop(terminal_model);
 
-        contents.add_child(output::render(
+        let agent_run = self.agent_run(app);
+        let mut hide_agent_content = false;
+        if let Some(run) = agent_run {
+            if run.is_head && run.step_count >= 2 {
+                contents.add_child(output::render_agent_run_card(
+                    &run,
+                    self.agent_run_expanded,
+                    &self.agent_run_mouse_state,
+                    app,
+                ));
+            }
+            // A collapsed run shows only the summary card; its other steps are
+            // hidden by the block list. Once expanded, each step shows a single
+            // collapsed row that can then be opened on its own.
+            let run_open = !run.is_head || self.agent_run_expanded;
+            let step_is_expanded = self.agent_step_is_expanded(app);
+            hide_agent_content = !run_open || !step_is_expanded;
+            if run_open {
+                contents.add_child(output::render_agent_step_row(
+                    &run,
+                    step_is_expanded,
+                    self.agent_step_headline(app),
+                    &self.agent_step_mouse_state,
+                    app,
+                ));
+            }
+        }
+
+        contents.add_child(if hide_agent_content {
+            Empty::new().finish()
+        } else {
+            output::render(
             output::Props {
                 model: self.model.as_ref(),
                 state_handles: &self.state_handles,
@@ -1083,7 +1115,8 @@ impl View for AIBlock {
                 ask_user_question_view: self.ask_user_question_view.as_ref(),
             },
             app,
-        ));
+            )
+        });
 
         let should_use_transparent_overlay = InputSettings::as_ref(app)
             .is_universal_developer_input_enabled(app)
@@ -1326,5 +1359,38 @@ impl AIAgentInput {
             | AIAgentInput::EventsFromAgents { .. }
             | AIAgentInput::PassiveSuggestionResult { .. } => None,
         }
+    }
+}
+
+impl AIBlock {
+    /// A one-line summary of what this step did, shown on the right side of its
+    /// collapsed row inside an expanded run.
+    pub fn agent_step_headline(&self, app: &AppContext) -> Option<String> {
+        use crate::ai::agent::{AIAgentOutputMessageType, AIAgentTextSection};
+
+        let output = self.model.status(app).output_to_render()?;
+        let messages = &output.get().messages;
+        let reasoning = messages.iter().rev().find_map(|message| match &message.message {
+            AIAgentOutputMessageType::Reasoning { text, .. }
+                if !output::are_all_text_sections_empty(&text.sections) =>
+            {
+                Some(text)
+            }
+            _ => None,
+        })?;
+        let line = reasoning.sections.iter().find_map(|section| match section {
+            AIAgentTextSection::PlainText { text } => text
+                .text()
+                .lines()
+                .map(str::trim)
+                .find(|line: &&str| !line.is_empty())
+                .map(str::to_owned),
+            _ => None,
+        })?;
+        let mut short: String = line.chars().take(64).collect();
+        if line.chars().count() > 64 {
+            short.push('…');
+        }
+        Some(short)
     }
 }
