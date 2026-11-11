@@ -21,7 +21,7 @@ Warp 是一个以 Rust 为主的 **agentic 终端 / 开发环境**:在一个自�
 | `resources/` | 字体、图标、shell 集成脚本、shaders 等运行时资源 |
 | `docker/` | 容器化构建相关 |
 | `specs/` | 产品/技术 spec 文档 |
-| `.agents/skills`, `.claude/skills` | agent 工作流的 skill 描述(创建 PR、修复错误、特性灰度等) |
+| `.agents/skills` | 技能已迁出到 Obsidian 知识库 `~/Code/quartz/content/ai-reference/skills/`，此处仅保留 README |
 | `.warp/`, `.config/`, `.cargo/`, `.vscode/` | 各类工具配置 |
 
 构建系统:Cargo workspace,`resolver = "2"`,`default-members` 故意收敛到经常需要编译/测试的子集(见 `Cargo.toml`)。`serve-wasm` 与 `integration` 默认不在 `default-members` 内。
