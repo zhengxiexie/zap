@@ -883,6 +883,10 @@ pub struct Workspace {
     palette: ViewHandle<CommandPalette>,
     ctrl_tab_palette: ViewHandle<CommandPalette>,
     mouse_states: WorkspaceMouseStates,
+    /// 上一次渲染时的阻塞会话数，用于避免重复触发 Dock 跳动。
+    last_blocked_agent_count: usize,
+    /// Agent 状态胶囊的展开列表是否正在被 hover。
+    agent_presence_list_hovered: bool,
     settings_pane: ViewHandle<SettingsView>,
     import_modal: ViewHandle<ImportModal>,
     theme_chooser_view: ViewHandle<ThemeChooser>,
@@ -2882,6 +2886,8 @@ impl Workspace {
             palette,
             ctrl_tab_palette,
             mouse_states: Default::default(),
+            last_blocked_agent_count: 0,
+            agent_presence_list_hovered: false,
             previous_theme: None,
             theme_override: None,
             previous_theme_override: None,
@@ -3057,6 +3063,13 @@ impl Workspace {
             event,
             BlocklistAIHistoryEvent::UpdatedConversationStatus { .. }
         ) {
+            let blocked = super::agent_presence::summarize(ctx).blocked_count();
+            if blocked > self.last_blocked_agent_count {
+                ctx.request_user_attention();
+            }
+            self.last_blocked_agent_count = blocked;
+            ctx.set_dock_badge((blocked > 0).then(|| blocked.to_string()).as_deref());
+            self.update_window_title(ctx);
             ctx.notify();
         }
 
@@ -4488,6 +4501,14 @@ impl Workspace {
         let tab_title = tab.pane_group.as_ref(ctx).display_title(ctx);
 
         let window_title = truncate_from_end(&tab_title, MAX_WINDOW_TITLE_LENGTH);
+
+        // 有会话在等用户确认时，把数字放在窗口标题最前面。
+        let blocked = super::agent_presence::summarize(ctx).blocked_count();
+        let window_title = if blocked > 0 {
+            format!("({blocked}) {window_title}")
+        } else {
+            window_title
+        };
 
         let window_id = ctx.window_id();
         ctx.windows().set_window_title(window_id, &window_title);
@@ -16255,6 +16276,26 @@ impl Workspace {
         .finish()
     }
 
+    /// Renders the workspace-level agent presence pill.
+    ///
+    /// It aggregates every live conversation's status and jumps to the most
+    /// urgent one when clicked. Returns `None` when nothing needs attention.
+    fn render_agent_presence(
+        &self,
+        appearance: &Appearance,
+        ctx: &AppContext,
+    ) -> Option<Box<dyn Element>> {
+        let summary = super::agent_presence::summarize(ctx);
+        super::agent_presence::render(
+            &summary,
+            self.mouse_states.agent_presence.clone(),
+            self.mouse_states.agent_presence_list.clone(),
+            &self.mouse_states.agent_presence_rows,
+            self.agent_presence_list_hovered,
+            appearance,
+        )
+    }
+
     fn render_tab_bar_contents(
         &self,
         hover_fixed_width: Option<f32>,
@@ -16367,6 +16408,10 @@ impl Workspace {
             let mut right_controls = Flex::row()
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_main_axis_size(MainAxisSize::Min);
+
+            if let Some(presence) = self.render_agent_presence(appearance, ctx) {
+                right_controls.add_child(Container::new(presence).with_margin_right(8.).finish());
+            }
 
             // 标题栏 agent 快捷启动按钮（垂直标签栏模式）
             for button in self.render_cli_agent_titlebar_buttons(appearance, ctx) {
@@ -16511,6 +16556,10 @@ impl Workspace {
 
         // Placeholder to make sure the flex row expands across the entire width of the app.
         tab_bar.add_child(Shrinkable::new(0.5, Empty::new().finish()).finish());
+
+        if let Some(presence) = self.render_agent_presence(appearance, ctx) {
+            tab_bar.add_child(Container::new(presence).with_margin_left(8.).finish());
+        }
 
         // 标题栏 agent 快捷启动按钮（水平标签栏模式）
         for button in self.render_cli_agent_titlebar_buttons(appearance, ctx) {
@@ -20393,6 +20442,10 @@ impl TypedActionView for Workspace {
                     );
                 }
             }
+            SetAgentPresenceListHovered(hovered) => {
+                self.agent_presence_list_hovered = *hovered;
+                ctx.notify();
+            }
             ShowRewindConfirmationDialog {
                 ai_block_view_id,
                 exchange_id,
@@ -20942,6 +20995,21 @@ impl View for Workspace {
                         ParentOffsetBounds::WindowByPosition,
                         ParentAnchor::TopLeft,
                         ChildAnchor::TopLeft,
+                    ),
+                );
+            }
+        }
+
+        // 标签栏隐藏时，状态胶囊以浮动形式固定在右上角，保证始终可见。
+        if !tab_bar_mode.has_tab_bar() {
+            if let Some(presence) = self.render_agent_presence(appearance, app) {
+                stack.add_positioned_overlay_child(
+                    presence,
+                    OffsetPositioning::offset_from_parent(
+                        vec2f(-12., 12.),
+                        ParentOffsetBounds::WindowByPosition,
+                        ParentAnchor::TopRight,
+                        ChildAnchor::TopRight,
                     ),
                 );
             }

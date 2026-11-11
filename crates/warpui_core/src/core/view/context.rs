@@ -387,6 +387,11 @@ impl<'a, T: View> ViewContext<'a, T> {
         self.app.request_user_attention(window_id);
     }
 
+    /// 设置 macOS Dock 角标（传入 `None` 清除）。
+    pub fn set_dock_badge(&self, label: Option<&str>) {
+        self.app.set_dock_badge(label);
+    }
+
     /// Global actions are being phased out. Prefer dispatching typed actions instead of global actions.
     /// Dispatch a global action to be handled by the registered handler
     ///

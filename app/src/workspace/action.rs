@@ -518,6 +518,8 @@ pub enum WorkspaceAction {
     ToggleGlobalSearch,
     OpenGlobalSearch,
     ToggleConversationListView,
+    /// 记录 Agent 状态胶囊展开列表是否处于 hover 状态。
+    SetAgentPresenceListHovered(bool),
     /// Reset the AWS Bedrock login banner dismissed state (for debugging).
     #[cfg(debug_assertions)]
     DebugResetAwsBedrockLoginBannerDismissed,
@@ -833,6 +835,7 @@ impl WorkspaceAction {
             | ToggleGlobalSearch
             | OpenGlobalSearch
             | ToggleConversationListView
+            | SetAgentPresenceListHovered(_)
             | ToggleNotificationMailbox { .. }
             | ToggleAIDocumentPane { .. }
             | HideAIDocumentPanes

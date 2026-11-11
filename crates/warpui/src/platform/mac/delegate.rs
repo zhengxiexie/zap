@@ -312,6 +312,17 @@ impl platform::Delegate for AppDelegate {
         }
     }
 
+    fn set_dock_badge(&self, label: Option<&str>) {
+        unsafe {
+            let dock_tile: id = msg_send![NSApp(), dockTile];
+            let label: id = match label {
+                Some(text) => make_nsstring(text),
+                None => nil,
+            };
+            let () = msg_send![dock_tile, setBadgeLabel: label];
+        }
+    }
+
     fn request_desktop_notification_permissions(
         &self,
         on_completion_callback: platform::RequestNotificationPermissionsCallback,

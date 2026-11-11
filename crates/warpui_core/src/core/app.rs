@@ -2104,6 +2104,11 @@ impl AppContext {
         self.platform_delegate.request_user_attention(window_id);
     }
 
+    /// 设置 macOS Dock 角标。其他平台为无操作。
+    pub(super) fn set_dock_badge(&self, label: Option<&str>) {
+        self.platform_delegate.set_dock_badge(label);
+    }
+
     /// Delegates to the OS to show the system character palette.
     pub fn open_character_palette(&mut self) {
         self.platform_delegate.open_character_palette();

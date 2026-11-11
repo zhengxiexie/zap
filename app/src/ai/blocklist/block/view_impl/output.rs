@@ -2858,7 +2858,7 @@ pub(super) fn blocked_action_header<V: View>(
 const REASONING_PREVIEW_MAX_CHARS: usize = 48;
 
 /// 紧凑耗时格式:12s / 1m 05s。思考标题需要塞进一行,所以不用长句式。
-fn format_compact_elapsed(elapsed: std::time::Duration) -> String {
+pub(crate) fn format_compact_elapsed(elapsed: std::time::Duration) -> String {
     let total_seconds = elapsed.as_secs();
     if total_seconds >= 60 {
         format!("{}m {}s", total_seconds / 60, total_seconds % 60)

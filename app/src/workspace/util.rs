@@ -8,6 +8,7 @@ use warpui::{
 };
 
 use super::OneTimeModalModel;
+use crate::ai::agent::conversation::AIConversationId;
 use crate::window_settings::WindowSettings;
 use crate::{
     appearance::Appearance, pane_group::PaneId, terminal::TerminalView, workspace::Workspace,
@@ -41,6 +42,12 @@ pub(super) struct WorkspaceMouseStates {
     pub(super) header_dimming: MouseStateHandle,
     pub(super) right_panel_icon: MouseStateHandle,
     pub(super) notifications_mailbox: MouseStateHandle,
+    /// 工作区级 Agent 状态胶囊的 hover 状态。
+    pub(super) agent_presence: MouseStateHandle,
+    /// 胶囊展开后每个会话行的 hover 状态。
+    pub(super) agent_presence_rows: RefCell<HashMap<AIConversationId, MouseStateHandle>>,
+    /// 胶囊展开列表整体的 hover 状态，用于鼠标移入列表时保持展开。
+    pub(super) agent_presence_list: MouseStateHandle,
     pub(super) session_config_tab_config_chip_close: MouseStateHandle,
     pub(super) tools_panel_icon: MouseStateHandle,
     pub(super) title_bar_search_bar: MouseStateHandle,

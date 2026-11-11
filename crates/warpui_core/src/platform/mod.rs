@@ -196,6 +196,9 @@ pub trait Delegate: 'static {
 
     fn request_user_attention(&self, window_id: WindowId);
 
+    /// 设置 macOS Dock 角标。其他平台默认无操作。
+    fn set_dock_badge(&self, _label: Option<&str>) {}
+
     fn clipboard(&mut self) -> &mut dyn Clipboard;
 
     fn system_theme(&self) -> SystemTheme;
