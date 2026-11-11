@@ -26,11 +26,11 @@ use crate::ai::agent::SuggestPromptResult;
 use crate::ai::agent::TodoOperation;
 use crate::ai::ai_document_view::DEFAULT_PLANNING_DOCUMENT_TITLE;
 use crate::ai::blocklist::agent_view::{AgentViewController, AgentViewEntryOrigin};
+use crate::ai::blocklist::block_runs::AgentRunInfo;
 use crate::ai::blocklist::context_model::AttachmentType;
 use crate::ai::blocklist::inline_action::code_diff_view::convert_file_edits_to_file_diffs;
 use crate::ai::blocklist::inline_action::suggested_unit_tests::SuggestedUnitTestsEvent;
 use crate::ai::blocklist::inline_action::suggested_unit_tests::SuggestedUnitTestsView;
-use crate::ai::blocklist::block_runs::AgentRunInfo;
 use crate::ai::blocklist::BlocklistAIContextEvent;
 use crate::ai::blocklist::BlocklistAIContextModel;
 use crate::ai::blocklist::SuggestionDismissButtonTheme;
@@ -147,9 +147,10 @@ use warpui::{
 
 use crate::ai::agent::{
     AIAgentAction, AIAgentActionId, AIAgentActionType, AIAgentAttachment, AIAgentCitation,
-    AIAgentContext, AIAgentOutputMessage, AIAgentOutputMessageType, CreateDocumentsRequest,
-    CreateDocumentsResult, DocumentToCreate, EditDocumentsResult, ProgrammingLanguage,
-    RenderableAIError, RequestCommandOutputResult, SuggestedLoggingId, SummarizationType,
+    AIAgentContext, AIAgentExchange, AIAgentOutputMessage, AIAgentOutputMessageType,
+    CreateDocumentsRequest, CreateDocumentsResult, DocumentToCreate, EditDocumentsResult,
+    ProgrammingLanguage, RenderableAIError, RequestCommandOutputResult, SuggestedLoggingId,
+    SummarizationType,
 };
 use crate::ai::blocklist::inline_action::code_diff_view;
 use crate::ai::blocklist::inline_action::requested_command::{
@@ -910,7 +911,7 @@ pub struct AIBlock {
     /// Cached cross-block run for this step. Keyed on the conversation's
     /// exchange count, so appending a step invalidates it; streaming blocks
     /// bypass the cache entirely.
-    agent_run_cache: std::cell::Cell<Option<(usize, AgentRunInfo)>>,
+    agent_run_cache: std::cell::RefCell<Option<((usize, u64), AgentRunInfo)>>,
 
     review_changes_button: ViewHandle<ActionButton>,
     open_all_comments_button: ViewHandle<ActionButton>,
@@ -3754,6 +3755,25 @@ impl AIBlock {
     }
 }
 
+/// 判断一个 exchange 里是否有失败的工具调用。
+///
+/// exchange 本身可能仍标记为成功（模型继续了对话），所以需要看 action 结果。
+fn exchange_has_failed_action(
+    exchange: &AIAgentExchange,
+    action_model: &BlocklistAIActionModel,
+) -> bool {
+    let Some(output) = exchange.output_status.output() else {
+        return false;
+    };
+    let output = output.get();
+    output.messages.iter().any(|message| match &message.message {
+        AIAgentOutputMessageType::Action(action) => action_model
+            .get_action_status(&action.id)
+            .is_some_and(|status| status.is_failed()),
+        _ => false,
+    })
+}
+
 impl AIBlock {
     pub fn conversation_id(&self) -> AIConversationId {
         self.client_ids.conversation_id
@@ -3870,17 +3890,29 @@ impl AIBlock {
         let is_streaming = self.model.status(app).is_streaming();
 
         if !is_streaming {
-            if let Some((cached_count, cached)) = self.agent_run_cache.get() {
-                if cached_count == exchange_count {
+            if let Some(((cached_count, cached_revision), cached)) =
+                self.agent_run_cache.borrow().clone()
+            {
+                if cached_count == exchange_count
+                    && cached_revision == self.action_model.as_ref(app).result_revision()
+                {
                     return Some(cached);
                 }
             }
         }
-
         let exchanges: Vec<_> = conversation.root_task_exchanges().collect();
         let summaries: Vec<AgentStepSummary> = exchanges
             .iter()
-            .map(|exchange| summarize_exchange(exchange))
+            .map(|exchange| {
+                let mut summary = summarize_exchange(exchange);
+                // 命令/编辑失败不会让 exchange 本身失败，需要看 action 结果。
+                if summary.status != crate::ai::blocklist::block_runs::StepStatus::Running
+                    && exchange_has_failed_action(exchange, self.action_model.as_ref(app))
+                {
+                    summary.status = crate::ai::blocklist::block_runs::StepStatus::Failed;
+                }
+                summary
+            })
             .collect();
         let steps: Vec<BlockStep> = summaries
             .iter()
@@ -3893,7 +3925,8 @@ impl AIBlock {
         let info = agent_run_containing(&steps, &summaries, &exchange_ids, index)?;
 
         if !is_streaming {
-            self.agent_run_cache.set(Some((exchange_count, info)));
+            let revision = self.action_model.as_ref(app).result_revision();
+            *self.agent_run_cache.borrow_mut() = Some(((exchange_count, revision), info.clone()));
         }
         Some(info)
     }
@@ -3908,11 +3941,40 @@ impl AIBlock {
         ctx.notify();
     }
 
-    /// Whether this step's full content is shown inside an expanded run.
-    pub fn agent_step_is_expanded(&self, app: &AppContext) -> bool {
+    /// 该步的完整内容是否在 run 中展开显示。
+    ///
+    /// 最新步骤和失败的步骤默认展开，保证用户始终能看到“现在在干什么”。
+    pub fn agent_step_is_expanded(
+        &self,
+        run: &crate::ai::blocklist::block_runs::AgentRunInfo,
+        app: &AppContext,
+    ) -> bool {
+        let model = crate::ai::blocklist::history_model::BlocklistAIHistoryModel::as_ref(app);
+        match model.expanded_agent_steps(
+            &self.client_ids.conversation_id,
+            &run.head_exchange_id,
+        ) {
+            Some(expanded) => expanded.contains(&self.client_ids.client_exchange_id),
+            None => run.is_last || run.status.is_failed(),
+        }
+    }
+
+    /// run 内是否所有步骤都已显式展开。
+    pub fn all_agent_steps_expanded(
+        &self,
+        run: &crate::ai::blocklist::block_runs::AgentRunInfo,
+        app: &AppContext,
+    ) -> bool {
         crate::ai::blocklist::history_model::BlocklistAIHistoryModel::as_ref(app)
-            .expanded_agent_step(&self.client_ids.conversation_id)
-            == Some(self.client_ids.client_exchange_id)
+            .expanded_agent_steps(
+                &self.client_ids.conversation_id,
+                &run.head_exchange_id,
+            )
+            .is_some_and(|expanded| {
+                run.member_exchange_ids
+                    .iter()
+                    .all(|exchange_id| expanded.contains(exchange_id))
+            })
     }
 
     /// Returns `true` if the block contains any actions that are blocked on user confirmation.
@@ -5510,6 +5572,8 @@ pub enum AIBlockAction {
     ToggleAgentRunExpanded,
     /// Expand or collapse this step's full content inside a run.
     ToggleAgentStepExpanded,
+    /// 展开或收起 run 内所有步骤的完整内容（⌘+点击）。
+    ToggleAgentRunAllStepsExpanded,
     SetCollapsibleBlockPinnedToBottom {
         message_id: MessageId,
         pinned_to_bottom: bool,
@@ -5990,35 +6054,65 @@ impl TypedActionView for AIBlock {
                 }
             }
             AIBlockAction::ToggleAgentRunExpanded => {
+                let run_head = self.agent_run(ctx).map(|run| run.head_exchange_id);
                 self.agent_run_expanded = !self.agent_run_expanded;
-                self.agent_run_cache.set(None);
+                *self.agent_run_cache.borrow_mut() = None;
                 if !self.agent_run_expanded {
                     // Collapsing a run collapses every step inside it.
                     let conversation_id = self.client_ids.conversation_id;
                     crate::ai::blocklist::history_model::BlocklistAIHistoryModel::handle(ctx)
                         .update(ctx, |model, _| {
-                            model.set_expanded_agent_step(conversation_id, None);
+                            if let Some(run_head) = run_head {
+                                model.clear_expanded_agent_steps(conversation_id, &run_head);
+                            }
                         });
                 }
             }
             AIBlockAction::ToggleAgentStepExpanded => {
                 let conversation_id = self.client_ids.conversation_id;
                 let exchange_id = self.client_ids.client_exchange_id;
-                let currently_expanded = crate::ai::blocklist::history_model::BlocklistAIHistoryModel::as_ref(
-                    ctx,
-                )
-                .expanded_agent_step(&conversation_id);
-                let next = if currently_expanded == Some(exchange_id) {
-                    None
-                } else {
-                    Some(exchange_id)
+                let run = self.agent_run(ctx);
+                let run_head_id = run
+                    .as_ref()
+                    .map(|run| run.head_exchange_id)
+                    .unwrap_or(exchange_id);
+                let currently_expanded = match run.as_ref() {
+                    Some(run) => self.agent_step_is_expanded(run, ctx),
+                    None => false,
                 };
                 crate::ai::blocklist::history_model::BlocklistAIHistoryModel::handle(ctx).update(
                     ctx,
                     |model, _| {
-                        model.set_expanded_agent_step(conversation_id, next);
+                        let mut expanded = HashSet::new();
+                        if !currently_expanded {
+                            expanded.insert(exchange_id);
+                        }
+                        model.set_expanded_agent_steps(conversation_id, run_head_id, expanded);
                     },
                 );
+            }
+            AIBlockAction::ToggleAgentRunAllStepsExpanded => {
+                // ⌘+点击时展开 run 内全部步骤。
+                self.agent_run_expanded = true;
+                *self.agent_run_cache.borrow_mut() = None;
+                let conversation_id = self.client_ids.conversation_id;
+                if let Some(run) = self.agent_run(ctx) {
+                    let run_head_id = run.head_exchange_id;
+                    let all_expanded = self.all_agent_steps_expanded(&run, ctx);
+                    crate::ai::blocklist::history_model::BlocklistAIHistoryModel::handle(ctx)
+                        .update(ctx, |model, _| {
+                            let expanded = if all_expanded {
+                                HashSet::new()
+                            } else {
+                                run.member_exchange_ids.iter().copied().collect()
+                            };
+                            model.set_expanded_agent_steps(
+                                conversation_id,
+                                run_head_id,
+                                expanded,
+                            );
+                        });
+                }
             }
             AIBlockAction::ToggleCodeReviewPane => {
                 ctx.emit(AIBlockEvent::ToggleCodeReviewPane {

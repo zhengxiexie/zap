@@ -19,7 +19,7 @@ use crate::ai::blocklist::block::view_impl::common::{
 use crate::ai::blocklist::inline_action::aws_bedrock_credentials_error::AwsBedrockCredentialsErrorView;
 use crate::ai::blocklist::inline_action::create_or_edit_document::CreateOrEditDocumentAction;
 use crate::ai::blocklist::secret_redaction::SecretRedactionState;
-use crate::ai::blocklist::view_util::format_credits;
+use crate::ai::blocklist::view_util::{error_color, format_credits};
 use crate::ai::skills::SkillOpenOrigin;
 use crate::ai::skills::{
     icon_override_for_skill_name, render_skill_button, skill_path_from_file_path,
@@ -108,7 +108,9 @@ use itertools::Itertools;
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
 use warp_core::channel::ChannelState;
 
-use super::action_groups::{compute_action_groups, group_starting_at, ActionGroup};
+use super::action_groups::{
+    compute_action_groups, group_starting_at, ActionGroup, ActionGroupCounts,
+};
 use super::common::{
     render_debug_footer, render_failed_output, render_informational_footer,
     render_output_status_text, render_scrollable_collapsible_content, render_text_sections,
@@ -123,6 +125,7 @@ use super::{
     render_citation_chips, todos::render_completed_todo_items, WithContentItemSpacing,
     CONTENT_ITEM_VERTICAL_MARGIN,
 };
+use crate::ai::blocklist::block_runs::StepStatus;
 use warpui::{
     elements::{
         Align, Border, ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
@@ -988,7 +991,9 @@ pub(super) fn render(props: Props, app: &AppContext) -> Box<dyn Element> {
                                 body_color,
                                 Default::default(),
                             )
-                            .with_heading_to_font_size_multipliers(appearance.heading_font_size_multipliers().clone())
+                            .with_heading_to_font_size_multipliers(
+                                appearance.heading_font_size_multipliers().clone(),
+                            )
                             .set_selectable(true);
 
                             let mut action =
@@ -3025,6 +3030,76 @@ fn render_collapsible_header(
         .finish()
 }
 
+/// 步骤状态图标：运行中转圈，完成打勾，失败告警。
+fn agent_status_icon(status: StepStatus, color: ColorU, icon_size: f32) -> Box<dyn Element> {
+    let icon = match status {
+        StepStatus::Running => Icon::Loading,
+        StepStatus::Succeeded => Icon::Check,
+        StepStatus::Failed => Icon::AlertTriangle,
+        StepStatus::Cancelled => Icon::Cancelled,
+    };
+    ConstrainedBox::new(icon.to_warpui_icon(color.into()).finish())
+        .with_width(icon_size - 4.)
+        .with_height(icon_size - 4.)
+        .finish()
+}
+
+/// 紧凑的 `✎1 ▶6 ▸8` 计数，替代冗长的 `1 edit · 6 commands` 文案，便于扫读。
+fn render_agent_counts(
+    counts: ActionGroupCounts,
+    color: ColorU,
+    font_family: &warpui::fonts::FamilyId,
+    font_size: f32,
+    icon_size: f32,
+) -> Option<Box<dyn Element>> {
+    let entries = [
+        (counts.edits, Icon::Pencil),
+        (counts.commands, Icon::Play),
+        (counts.reads, Icon::BookOpen),
+        (counts.tools, Icon::Tool2),
+    ];
+    let mut row = Flex::row()
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_spacing(8.);
+    let mut has_any = false;
+    for (count, icon) in entries {
+        if count == 0 {
+            continue;
+        }
+        has_any = true;
+        row = row.with_child(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(2.)
+                .with_child(
+                    ConstrainedBox::new(icon.to_warpui_icon(color.into()).finish())
+                        .with_width(icon_size - 6.)
+                        .with_height(icon_size - 6.)
+                        .finish(),
+                )
+                .with_child(
+                    Text::new(count.to_string(), font_family.to_owned(), font_size)
+                        .with_color(color)
+                        .with_selectable(false)
+                        .finish(),
+                )
+                .finish(),
+        );
+    }
+    has_any.then(|| row.finish())
+}
+
+/// 汇总卡片显示的整轮状态。
+fn run_status(run: &crate::ai::blocklist::block_runs::AgentRunInfo) -> StepStatus {
+    if run.has_failure {
+        StepStatus::Failed
+    } else if run.is_running {
+        StepStatus::Running
+    } else {
+        StepStatus::Succeeded
+    }
+}
+
 /// Renders the header card for a collapsed run of agent steps. The card lives
 /// on the first block of the run and expands it to show every step again.
 pub(crate) fn render_agent_run_card(
@@ -3043,7 +3118,9 @@ pub(crate) fn render_agent_run_card(
     };
     let step_label = if run.step_count == 1 { "step" } else { "steps" };
     let steps_text = format!("{} {step_label}", run.step_count);
-    let detail_text = run.totals.summary_text();
+    let duration_text = run.duration().map(format_compact_elapsed);
+    let counts = run.totals;
+    let status = run_status(run);
     let font_family = appearance.ai_font_family();
     let font_size = appearance.monospace_font_size();
 
@@ -3058,27 +3135,29 @@ pub(crate) fn render_agent_run_card(
             };
             let main_color = blended_colors::text_main(theme, background);
             let muted_color = blended_colors::text_disabled(theme, background);
+            let status_color = if status == StepStatus::Failed {
+                error_color(theme)
+            } else {
+                muted_color
+            };
 
             let mut row = Flex::row()
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_spacing(6.)
                 .with_child(
-                    ConstrainedBox::new(
-                        chevron_icon
-                            .to_warpui_icon(muted_color.into())
-                            .finish(),
-                    )
-                    .with_width(icon_size - 4.)
-                    .with_height(icon_size - 4.)
-                    .finish(),
+                    ConstrainedBox::new(chevron_icon.to_warpui_icon(muted_color.into()).finish())
+                        .with_width(icon_size - 4.)
+                        .with_height(icon_size - 4.)
+                        .finish(),
                 )
+                .with_child(agent_status_icon(status, status_color, icon_size))
                 .with_child(
                     Text::new(steps_text.clone(), font_family.clone(), font_size)
                         .with_color(main_color)
                         .with_selectable(false)
                         .finish(),
                 );
-            if !detail_text.is_empty() {
+            if let Some(duration) = duration_text.clone() {
                 row = row
                     .with_child(
                         Text::new("·".to_owned(), font_family.clone(), font_size)
@@ -3087,11 +3166,16 @@ pub(crate) fn render_agent_run_card(
                             .finish(),
                     )
                     .with_child(
-                        Text::new(detail_text.clone(), font_family.clone(), font_size)
+                        Text::new(duration, font_family.clone(), font_size)
                             .with_color(muted_color)
                             .with_selectable(false)
                             .finish(),
                     );
+            }
+            if let Some(counts_element) =
+                render_agent_counts(counts, muted_color, &font_family, font_size, icon_size)
+            {
+                row = row.with_child(counts_element);
             }
 
             Container::new(row.finish())
@@ -3104,8 +3188,13 @@ pub(crate) fn render_agent_run_card(
         },
     )
     .with_cursor(Cursor::PointingHand)
-    .on_click(move |ctx, _, _| {
-        ctx.dispatch_typed_action(AIBlockAction::ToggleAgentRunExpanded);
+    .on_click_with_modifiers(move |ctx, _, _, modifiers| {
+        let action = if modifiers.cmd || modifiers.ctrl {
+            AIBlockAction::ToggleAgentRunAllStepsExpanded
+        } else {
+            AIBlockAction::ToggleAgentRunExpanded
+        };
+        ctx.dispatch_typed_action(action);
     });
 
     Container::new(Align::new(toggler.finish()).left().finish())
@@ -3114,8 +3203,7 @@ pub(crate) fn render_agent_run_card(
         .finish()
 }
 
-/// Renders one step of an expanded run as a single collapsed row. Clicking the
-/// row reveals that step's full output, so a long run stays scannable.
+/// 渲染一步折叠行。点击行会展开该步的完整输出，让长流程保持可扫读。
 pub(crate) fn render_agent_step_row(
     run: &crate::ai::blocklist::block_runs::AgentRunInfo,
     is_expanded: bool,
@@ -3132,7 +3220,8 @@ pub(crate) fn render_agent_step_row(
         Icon::ChevronRight
     };
     let step_text = format!("Step {}", run.position);
-    let detail_text = run.step_counts.summary_text();
+    let counts = run.step_counts;
+    let status = run.status;
     let font_family = appearance.ai_font_family();
     let font_size = appearance.monospace_font_size();
 
@@ -3147,6 +3236,11 @@ pub(crate) fn render_agent_step_row(
             };
             let main_color = blended_colors::text_sub(theme, theme.surface_2());
             let muted_color = blended_colors::text_disabled(theme, theme.surface_2());
+            let status_color = if status == StepStatus::Failed {
+                error_color(theme)
+            } else {
+                muted_color
+            };
 
             let mut row = Flex::row()
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -3157,28 +3251,13 @@ pub(crate) fn render_agent_step_row(
                         .with_height(icon_size - 4.)
                         .finish(),
                 )
+                .with_child(agent_status_icon(status, status_color, icon_size))
                 .with_child(
                     Text::new(step_text.clone(), font_family.clone(), font_size)
                         .with_color(main_color)
                         .with_selectable(false)
                         .finish(),
                 );
-            if !detail_text.is_empty() {
-                row = row
-                    .with_child(
-                        Text::new("·".to_owned(), font_family.clone(), font_size)
-                            .with_color(muted_color)
-                            .with_selectable(false)
-                            .finish(),
-                    )
-                    .with_child(
-                        Text::new(detail_text.clone(), font_family.clone(), font_size)
-                            .with_color(muted_color)
-                            .with_selectable(false)
-                            .finish(),
-                    );
-            }
-
             if let Some(headline) = headline.clone() {
                 row = row
                     .with_child(
@@ -3194,6 +3273,11 @@ pub(crate) fn render_agent_step_row(
                             .finish(),
                     );
             }
+            if let Some(counts_element) =
+                render_agent_counts(counts, muted_color, &font_family, font_size, icon_size)
+            {
+                row = row.with_child(counts_element);
+            }
 
             Container::new(row.finish())
                 .with_background(background)
@@ -3204,8 +3288,13 @@ pub(crate) fn render_agent_step_row(
         },
     )
     .with_cursor(Cursor::PointingHand)
-    .on_click(move |ctx, _, _| {
-        ctx.dispatch_typed_action(AIBlockAction::ToggleAgentStepExpanded);
+    .on_click_with_modifiers(move |ctx, _, _, modifiers| {
+        let action = if modifiers.cmd || modifiers.ctrl {
+            AIBlockAction::ToggleAgentRunAllStepsExpanded
+        } else {
+            AIBlockAction::ToggleAgentStepExpanded
+        };
+        ctx.dispatch_typed_action(action);
     });
 
     Container::new(Align::new(toggler.finish()).left().finish())

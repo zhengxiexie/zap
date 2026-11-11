@@ -1034,7 +1034,7 @@ impl View for AIBlock {
             // hidden by the block list. Once expanded, each step shows a single
             // collapsed row that can then be opened on its own.
             let run_open = !run.is_head || self.agent_run_expanded;
-            let step_is_expanded = self.agent_step_is_expanded(app);
+            let step_is_expanded = self.agent_step_is_expanded(&run, app);
             hide_agent_content = !run_open || !step_is_expanded;
             if run_open {
                 contents.add_child(output::render_agent_step_row(
@@ -1051,70 +1051,70 @@ impl View for AIBlock {
             Empty::new().finish()
         } else {
             output::render(
-            output::Props {
-                model: self.model.as_ref(),
-                state_handles: &self.state_handles,
-                action_buttons: &self.action_buttons,
-                action_model: &self.action_model,
-                editor_views: &self.code_editor_views,
-                current_working_directory: self.current_working_directory.as_ref(),
-                shell_launch_data: self.shell_launch_data.as_ref(),
-                detected_links_state: &self.detected_links_state,
-                secret_redaction_state: &self.secret_redaction_state,
-                requested_commands: &self.requested_commands,
-                requested_mcp_tools: &self.requested_mcp_tools,
-                requested_edits: &self.requested_edits,
-                unit_test_suggestions: &self.unit_tests_suggestions,
-                todo_list_states: &self.todo_list_states,
-                collapsible_block_states: &self.collapsible_block_states,
-                is_selecting_text: self.state_handles.selection_handle.is_selecting(),
-                is_ai_input_enabled: self
-                    .context_model
-                    .as_ref(app)
-                    .pending_context_selected_text()
-                    .is_some(),
-                find_context: self.find_model.as_ref(app).is_find_bar_open().then_some(
-                    FindContext {
-                        model: self.find_model.as_ref(app),
-                        state: &self.find_state,
-                    },
-                ),
-                is_references_section_open: self.is_references_section_open,
-                autonomy_setting_speedbump: &self.autonomy_setting_speedbump,
-                suggested_rules: &self.suggested_rules,
-                suggested_agent_mode_workflow: &self.suggested_agent_mode_workflow,
-                manage_rules_button: &self.manage_rules_button,
-                keyboard_navigable_buttons: self.keyboard_navigable_buttons.as_ref(),
-                request_refunded_count: self.request_refunded_count,
-                web_search_views: &self.web_search_views,
-                web_fetch_views: &self.web_fetch_views,
-                review_changes_button: &self.review_changes_button,
-                open_all_comments_button: &self.open_all_comments_button,
-                dismiss_suggestion_button: &self.dismiss_suggestion_button,
-                disable_rule_suggestions_button: &self.disable_rule_suggestions_button,
-                has_accepted_edits,
-                current_todo_list: self.current_todo_list(app),
-                finish_reason: self.finish_reason.as_ref(),
-                is_usage_footer_expanded: self.is_usage_footer_expanded,
-                shared_session_status: &shared_session_status,
-                terminal_view_id: self.terminal_view_id,
-                is_conversation_transcript_viewer,
-                aws_bedrock_credentials_error_view: self
-                    .aws_bedrock_credentials_error_view
-                    .as_ref(),
-                imported_comments: &self.imported_comments,
-                #[cfg(feature = "local_fs")]
-                resolved_code_block_paths: &self.resolved_code_block_paths,
-                #[cfg(feature = "local_fs")]
-                resolved_blocklist_image_sources: &self.resolved_blocklist_image_sources,
-                thinking_display_mode: AISettings::as_ref(app).thinking_display_mode,
-                conversation_has_imported_comments: self
-                    .model
-                    .is_latest_non_passive_exchange_in_root_task(app)
-                    && self.has_imported_comments_in_current_thread(app),
-                ask_user_question_view: self.ask_user_question_view.as_ref(),
-            },
-            app,
+                output::Props {
+                    model: self.model.as_ref(),
+                    state_handles: &self.state_handles,
+                    action_buttons: &self.action_buttons,
+                    action_model: &self.action_model,
+                    editor_views: &self.code_editor_views,
+                    current_working_directory: self.current_working_directory.as_ref(),
+                    shell_launch_data: self.shell_launch_data.as_ref(),
+                    detected_links_state: &self.detected_links_state,
+                    secret_redaction_state: &self.secret_redaction_state,
+                    requested_commands: &self.requested_commands,
+                    requested_mcp_tools: &self.requested_mcp_tools,
+                    requested_edits: &self.requested_edits,
+                    unit_test_suggestions: &self.unit_tests_suggestions,
+                    todo_list_states: &self.todo_list_states,
+                    collapsible_block_states: &self.collapsible_block_states,
+                    is_selecting_text: self.state_handles.selection_handle.is_selecting(),
+                    is_ai_input_enabled: self
+                        .context_model
+                        .as_ref(app)
+                        .pending_context_selected_text()
+                        .is_some(),
+                    find_context: self.find_model.as_ref(app).is_find_bar_open().then_some(
+                        FindContext {
+                            model: self.find_model.as_ref(app),
+                            state: &self.find_state,
+                        },
+                    ),
+                    is_references_section_open: self.is_references_section_open,
+                    autonomy_setting_speedbump: &self.autonomy_setting_speedbump,
+                    suggested_rules: &self.suggested_rules,
+                    suggested_agent_mode_workflow: &self.suggested_agent_mode_workflow,
+                    manage_rules_button: &self.manage_rules_button,
+                    keyboard_navigable_buttons: self.keyboard_navigable_buttons.as_ref(),
+                    request_refunded_count: self.request_refunded_count,
+                    web_search_views: &self.web_search_views,
+                    web_fetch_views: &self.web_fetch_views,
+                    review_changes_button: &self.review_changes_button,
+                    open_all_comments_button: &self.open_all_comments_button,
+                    dismiss_suggestion_button: &self.dismiss_suggestion_button,
+                    disable_rule_suggestions_button: &self.disable_rule_suggestions_button,
+                    has_accepted_edits,
+                    current_todo_list: self.current_todo_list(app),
+                    finish_reason: self.finish_reason.as_ref(),
+                    is_usage_footer_expanded: self.is_usage_footer_expanded,
+                    shared_session_status: &shared_session_status,
+                    terminal_view_id: self.terminal_view_id,
+                    is_conversation_transcript_viewer,
+                    aws_bedrock_credentials_error_view: self
+                        .aws_bedrock_credentials_error_view
+                        .as_ref(),
+                    imported_comments: &self.imported_comments,
+                    #[cfg(feature = "local_fs")]
+                    resolved_code_block_paths: &self.resolved_code_block_paths,
+                    #[cfg(feature = "local_fs")]
+                    resolved_blocklist_image_sources: &self.resolved_blocklist_image_sources,
+                    thinking_display_mode: AISettings::as_ref(app).thinking_display_mode,
+                    conversation_has_imported_comments: self
+                        .model
+                        .is_latest_non_passive_exchange_in_root_task(app)
+                        && self.has_imported_comments_in_current_thread(app),
+                    ask_user_question_view: self.ask_user_question_view.as_ref(),
+                },
+                app,
             )
         });
 
@@ -1363,34 +1363,111 @@ impl AIAgentInput {
 }
 
 impl AIBlock {
-    /// A one-line summary of what this step did, shown on the right side of its
-    /// collapsed row inside an expanded run.
+    /// 该步做了什么的一行摘要，显示在折叠行右侧。
+    ///
+    /// 命令和文件路径比工具调用计数有用得多，因此优先取最近一次动作。
+    /// 只有没有动作时才回退到推理文本。
     pub fn agent_step_headline(&self, app: &AppContext) -> Option<String> {
         use crate::ai::agent::{AIAgentOutputMessageType, AIAgentTextSection};
 
         let output = self.model.status(app).output_to_render()?;
         let messages = &output.get().messages;
-        let reasoning = messages.iter().rev().find_map(|message| match &message.message {
-            AIAgentOutputMessageType::Reasoning { text, .. }
-                if !output::are_all_text_sections_empty(&text.sections) =>
-            {
-                Some(text)
-            }
-            _ => None,
-        })?;
-        let line = reasoning.sections.iter().find_map(|section| match section {
-            AIAgentTextSection::PlainText { text } => text
-                .text()
-                .lines()
-                .map(str::trim)
-                .find(|line: &&str| !line.is_empty())
-                .map(str::to_owned),
-            _ => None,
-        })?;
-        let mut short: String = line.chars().take(64).collect();
-        if line.chars().count() > 64 {
-            short.push('…');
+
+        if let Some(headline) = messages
+            .iter()
+            .rev()
+            .find_map(|message| match &message.message {
+                AIAgentOutputMessageType::Action(action) => action_headline(&action.action),
+                _ => None,
+            })
+        {
+            return Some(headline);
         }
-        Some(short)
+
+        let reasoning = messages
+            .iter()
+            .rev()
+            .find_map(|message| match &message.message {
+                AIAgentOutputMessageType::Reasoning { text, .. }
+                    if !output::are_all_text_sections_empty(&text.sections) =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            })?;
+        let line = reasoning
+            .sections
+            .iter()
+            .find_map(|section| match section {
+                AIAgentTextSection::PlainText { text } => text
+                    .text()
+                    .lines()
+                    .map(str::trim)
+                    .find(|line: &&str| !line.is_empty())
+                    .map(str::to_owned),
+                _ => None,
+            })?;
+        truncate_headline(&line)
     }
+}
+
+/// 摘要的最大长度，超出后截断并补省略号。
+const MAX_HEADLINE_CHARS: usize = 64;
+
+/// 将摘要限制为单行且不超过最大长度，保持步骤行易扫读。
+fn truncate_headline(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let mut short: String = line.chars().take(MAX_HEADLINE_CHARS).collect();
+    if line.chars().count() > MAX_HEADLINE_CHARS {
+        short.push('…');
+    }
+    Some(short)
+}
+
+/// 过长的路径只保留最后两级目录。
+fn short_path(path: &str) -> String {
+    if path.chars().count() <= 48 {
+        return path.to_owned();
+    }
+    let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    components.iter().rev().take(2).rev().copied().join("/")
+}
+
+/// 折叠行用于标识这一步的动作：执行的命令或触到的文件。
+fn action_headline(action: &crate::ai::agent::AIAgentActionType) -> Option<String> {
+    use crate::ai::agent::AIAgentActionType;
+
+    let text = match action {
+        AIAgentActionType::RequestCommandOutput { command, .. } => command.clone(),
+        AIAgentActionType::ReadFiles(request) => {
+            let first = request.locations.first()?;
+            let mut text = format!("read {}", short_path(&first.name));
+            let extra = request.locations.len().saturating_sub(1);
+            if extra > 0 {
+                text.push_str(&format!(" +{extra}"));
+            }
+            return truncate_headline(&text);
+        }
+        AIAgentActionType::RequestFileEdits { file_edits, .. } => {
+            let first = file_edits.iter().find_map(|edit| edit.file())?;
+            let mut text = format!("edit {}", short_path(first));
+            let extra = file_edits.len().saturating_sub(1);
+            if extra > 0 {
+                text.push_str(&format!(" +{extra}"));
+            }
+            return truncate_headline(&text);
+        }
+        AIAgentActionType::Grep { queries, .. } => {
+            let query = queries.first()?;
+            format!("grep \"{query}\"")
+        }
+        AIAgentActionType::FileGlob { patterns, .. }
+        | AIAgentActionType::FileGlobV2 { patterns, .. } => {
+            format!("find {}", patterns.first()?)
+        }
+        AIAgentActionType::ReadMCPResource { name, .. } => format!("read {name}"),
+        AIAgentActionType::CallMCPTool { name, .. } => format!("call {name}"),
+        _ => return None,
+    };
+    truncate_headline(&text)
 }

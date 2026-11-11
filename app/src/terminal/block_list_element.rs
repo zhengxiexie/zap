@@ -3191,7 +3191,11 @@ fn collapsed_rich_content_views(
             .as_ref(app)
             .is_agent_run_expanded()
         {
-            collapsed.insert(*view_id);
+            // 最新步骤和失败步骤保持可见：用户应该始终能看出“现在在干什么”，
+            // 失败也不能被默默折叠掉。
+            if !run.is_last && !run.status.is_failed() {
+                collapsed.insert(*view_id);
+            }
         }
     }
     collapsed

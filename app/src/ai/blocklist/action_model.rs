@@ -239,6 +239,9 @@ pub struct BlocklistAIActionModel {
     /// Past actions and their corresponding statuses from previous AI exchanges.
     past_action_results: HashMap<AIAgentActionId, Arc<AIAgentActionResult>>,
 
+    /// 递增的动作结果版本号，用于让依赖动作状态的 UI 缓存失效。
+    result_revision: u64,
+
     /// The ID of the terminal view this controller is associated with.
     terminal_view_id: EntityId,
 
@@ -307,6 +310,7 @@ impl BlocklistAIActionModel {
             pending_preprocessed_actions: Default::default(),
             is_view_only: false,
             ambient_agent_task_id: None,
+            result_revision: 0,
         }
     }
 
@@ -618,6 +622,11 @@ impl BlocklistAIActionModel {
         conversation_id: AIConversationId,
     ) -> Option<&Vec<Arc<AIAgentActionResult>>> {
         self.finished_action_results.get(&conversation_id)
+    }
+
+    /// 返回动作结果版本号；每次动作完成都会递增。
+    pub fn result_revision(&self) -> u64 {
+        self.result_revision
     }
 
     /// Returns the `AIActionStatus` for the action corresponding to the given `id`, if any.
@@ -1289,6 +1298,8 @@ impl BlocklistAIActionModel {
             .entry(conversation_id)
             .or_default()
             .push(action_result);
+
+        self.result_revision = self.result_revision.wrapping_add(1);
 
         ctx.emit(BlocklistAIActionEvent::FinishedAction {
             action_id,

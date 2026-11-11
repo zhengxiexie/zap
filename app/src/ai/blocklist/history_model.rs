@@ -200,10 +200,12 @@ pub struct BlocklistAIHistoryModel {
     /// via `set_parent_for_conversation` and `restore_conversations`.
     children_by_parent: HashMap<AIConversationId, Vec<AIConversationId>>,
 
-    /// The exchange whose step row is expanded inside a collapsed-run UI, per
-    /// conversation. Collapsing a run clears the entry so children collapse
-    /// together with their parent.
-    expanded_agent_step: HashMap<AIConversationId, AIAgentExchangeId>,
+    /// 每轮中显式展开的步骤：会话 id -> (run 头部 exchange id -> 展开的步骤集合)。
+    ///
+    /// 未出现 run 条目时使用默认展开（最新步骤、失败步骤保持打开）；
+    /// 空集合表示用户已显式收起该 run 的全部步骤。
+    expanded_agent_steps:
+        HashMap<AIConversationId, HashMap<AIAgentExchangeId, HashSet<AIAgentExchangeId>>>,
 
     #[cfg(feature = "local_fs")]
     db_connection: Option<Arc<Mutex<SqliteConnection>>>,
@@ -239,32 +241,43 @@ impl BlocklistAIHistoryModel {
         Self::default()
     }
 
-    /// The step whose row is expanded inside an expanded agent run.
-    pub fn expanded_agent_step(
+    /// 返回某个 run 中用户显式展开的步骤集合；未操作过时为 `None`。
+    pub fn expanded_agent_steps(
         &self,
         conversation_id: &AIConversationId,
-    ) -> Option<AIAgentExchangeId> {
-        self.expanded_agent_step.get(conversation_id).copied()
+        run_head_id: &AIAgentExchangeId,
+    ) -> Option<&HashSet<AIAgentExchangeId>> {
+        self.expanded_agent_steps
+            .get(conversation_id)
+            .and_then(|runs| runs.get(run_head_id))
     }
 
-    /// Sets (or clears, with `None`) the expanded step for a conversation.
-    pub fn set_expanded_agent_step(
+    /// 设置某个 run 中显式展开的步骤集合。
+    pub fn set_expanded_agent_steps(
         &mut self,
         conversation_id: AIConversationId,
-        exchange_id: Option<AIAgentExchangeId>,
+        run_head_id: AIAgentExchangeId,
+        exchange_ids: HashSet<AIAgentExchangeId>,
     ) {
-        match exchange_id {
-            Some(exchange_id) => {
-                self.expanded_agent_step.insert(conversation_id, exchange_id);
-            }
-            None => {
-                self.expanded_agent_step.remove(&conversation_id);
+        self.expanded_agent_steps
+            .entry(conversation_id)
+            .or_default()
+            .insert(run_head_id, exchange_ids);
+    }
+
+    /// 清除某个 run 的显式状态，恢复“最新步骤展开”的默认行为。
+    pub fn clear_expanded_agent_steps(
+        &mut self,
+        conversation_id: AIConversationId,
+        run_head_id: &AIAgentExchangeId,
+    ) {
+        if let Some(runs) = self.expanded_agent_steps.get_mut(&conversation_id) {
+            runs.remove(run_head_id);
+            if runs.is_empty() {
+                self.expanded_agent_steps.remove(&conversation_id);
             }
         }
     }
-
-    /// Returns a flattened and ordered (oldest first) list of live conversations (not cleared) for the given terminal view ID.
-    /// This works for terminal views that have been closed.
     pub fn all_live_conversations_for_terminal_view(
         &self,
         terminal_view_id: EntityId,
